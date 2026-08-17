@@ -1,0 +1,21 @@
+{
+  "ConfigVersion": 5,
+  "ServerRoot": "Auto",
+  "ServerExecutable": "DayZServer_x64.exe",
+  "BaseStartScript": "StartServer.bat",
+  "DayZLaunch": {
+    "ArgumentsOverride": "",
+    "AdditionalMods": [],
+    "AdditionalArguments": []
+  },
+  "VirtualCargoSettings": {
+    "AutoDiscoverCargoContainers": true,
+    "IncludeInheritedContainerClasses": true,
+    "EnableVehicleCargo": true,
+    "ContainerClassNames": [],
+    "ExcludedContainerClassNames": [
+      "ClippyVirtualCargoQuarantine",
+      "FireplaceBase"
+    ]
+  }
+}

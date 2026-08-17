@@ -1,0 +1,36 @@
+{
+  "Version": 5,
+  "Enabled": true,
+  "HostURL": "http://127.0.0.1:27815",
+  "ApiToken": "REPLACE_WITH_THE_SAME_RANDOM_TOKEN_IN_BOTH_CONFIGURATION_FILES",
+  "ConnectionTimeoutSeconds": 5,
+  "RequestTimeoutSeconds": 10,
+  "ProviderID": "clippy.dayz.virtual-cargo",
+  "VirtualRootCapacity": 10000,
+  "NativePageSize": 20,
+  "AccessDistanceMetres": 2.0,
+  "AutoOpenInventory": true,
+  "RejectContaminatedItems": true,
+  "RejectActiveOrPluggedItems": true,
+  "AutoDiscoverCargoContainers": true,
+  "IncludeInheritedContainerClasses": true,
+  "EnableVehicleCargo": true,
+  "EnableExistingCargoMigration": false,
+  "MigrationStartDelaySeconds": 5,
+  "MigrationBatchRootLimit": 20,
+  "MigrationConcurrentContainers": 2,
+  "MigrationScanBatchSize": 8,
+  "ReportUnlistedStorageCandidates": false,
+  "ReportEmptyUnlistedStorageCandidates": false,
+  "MinimumUnlistedPhysicalRoots": 1,
+  "ContainerClassNames": [],
+  "ExcludedContainerClassNames": [
+    "ClippyVirtualCargoQuarantine",
+    "FireplaceBase"
+  ],
+  "BlockedItemClassNames": [
+    "ExplosivesBase",
+    "TrapBase"
+  ],
+  "MaterializationIntervalMs": 1
+}

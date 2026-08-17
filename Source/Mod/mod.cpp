@@ -1,0 +1,10 @@
+name = "Clippy's Virtual Cargo";
+picture = "";
+logoSmall = "";
+logo = "";
+logoOver = "";
+tooltip = "Clippy's Virtual Cargo";
+overview = "Moves selected container cargo into a local PostgreSQL database while the container is closed.";
+action = "https://steamcommunity.com/sharedfiles/filedetails/?id=3782296362";
+author = "Clippy-1";
+version = "0.5.0";
