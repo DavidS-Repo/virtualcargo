@@ -5,6 +5,8 @@ $managerScript = [IO.Path]::GetFullPath($env:CLIPPY_MANAGER_SCRIPT)
 $managerPowerShell = [IO.Path]::GetFullPath($MyInvocation.MyCommand.Path)
 $managerRoot = [IO.Path]::GetFullPath($env:CLIPPY_MANAGER_ROOT).TrimEnd('\')
 $command = $env:CLIPPY_MANAGER_COMMAND.ToLowerInvariant()
+$managerRevision = 13
+Write-Host "Clippy Server Manager revision $managerRevision" -ForegroundColor Cyan
 $modName = '@Clippy SQLite Virtual Cargo'
 $workshopId = '3782296362'
 
@@ -79,8 +81,50 @@ function New-WindowsServicePassword {
 
 function Resolve-AbsolutePath {
     param([string]$Value, [string]$Base)
-    if ([IO.Path]::IsPathRooted($Value)) { return [IO.Path]::GetFullPath($Value) }
-    return [IO.Path]::GetFullPath((Join-Path $Base $Value))
+    $expanded = [Environment]::ExpandEnvironmentVariables($Value).Trim()
+    if ([IO.Path]::IsPathRooted($expanded)) { return [IO.Path]::GetFullPath($expanded) }
+    return [IO.Path]::GetFullPath((Join-Path $Base $expanded))
+}
+
+function Resolve-PostgresDataDirectory {
+    param([string]$Value, [string]$Base)
+    $expanded = [Environment]::ExpandEnvironmentVariables($Value).Trim()
+    if (-not $expanded) {
+        $expanded = '%ProgramData%\ClippyVirtualCargo\PostgreSQL\data'
+        $expanded = [Environment]::ExpandEnvironmentVariables($expanded)
+    }
+    $candidate = if ([IO.Path]::IsPathRooted($expanded)) {
+        [IO.Path]::GetFullPath($expanded)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $Base $expanded))
+    }
+
+    # A complete existing cluster is left where it is. New or incomplete clusters
+    # are moved out of Program Files because initdb must control the data ACLs.
+    if (Test-Path -LiteralPath (Join-Path $candidate 'PG_VERSION') -PathType Leaf) { return $candidate }
+
+    $protectedRoots = New-Object System.Collections.Generic.List[string]
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $root) { continue }
+        try {
+            $fullRoot = [IO.Path]::GetFullPath($root).TrimEnd('\')
+            if (-not ($protectedRoots | Where-Object { $_.Equals($fullRoot, [StringComparison]::OrdinalIgnoreCase) })) {
+                $protectedRoots.Add($fullRoot)
+            }
+        } catch { }
+    }
+    foreach ($root in $protectedRoots) {
+        $prefix = $root + '\'
+        if ($candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+            if (-not $programData) { $programData = $env:ProgramData }
+            if (-not $programData) { throw 'Windows ProgramData folder could not be resolved.' }
+            $safe = [IO.Path]::GetFullPath((Join-Path $programData 'ClippyVirtualCargo\PostgreSQL\data'))
+            Write-Warning "PostgreSQL data cannot be initialized safely under Program Files. Using $safe instead."
+            return $safe
+        }
+    }
+    return $candidate
 }
 
 function Assert-UnderRoot {
@@ -130,7 +174,7 @@ function Get-BuiltInConfiguration {
   },
   "PostgreSQL": {
     "Version": "18.4-1", "Port": 27816, "ServiceName": "ClippyPostgreSQL18",
-    "InstallDirectory": "ClippyPostgreSQL/18", "DataDirectory": "ClippyPostgreSQL/data",
+    "InstallDirectory": "ClippyPostgreSQL/18", "DataDirectory": "%ProgramData%/ClippyVirtualCargo/PostgreSQL/data",
     "InstallerUrl": "https://get.enterprisedb.com/postgresql/postgresql-18.4-1-windows-x64.exe",
     "InstallerSHA256": "44B8187D2DB7E866495952D8260A1D7252CBB5125843142E1F0BF30115D23279"
   },
@@ -279,7 +323,7 @@ $installedManagerConfig = Join-Path $serverRoot 'ClippyServerManager.json'
 $installedManagerState = Join-Path $serverRoot 'ClippyServerManager.state.json'
 $installedSecrets = Join-Path $installedHost '.clippy-secrets.json'
 $postgresInstall = Resolve-AbsolutePath -Value $config.PostgreSQL.InstallDirectory.ToString() -Base $serverRoot
-$postgresData = Resolve-AbsolutePath -Value $config.PostgreSQL.DataDirectory.ToString() -Base $serverRoot
+$postgresData = Resolve-PostgresDataDirectory -Value $config.PostgreSQL.DataDirectory.ToString() -Base $serverRoot
 $postgresBin = Join-Path $postgresInstall 'bin'
 $postgresPsql = Join-Path $postgresBin 'psql.exe'
 $postgresCreatedb = Join-Path $postgresBin 'createdb.exe'
@@ -360,6 +404,70 @@ function Get-OrCreateSecrets {
 
 function Get-PostgresService {
     return Get-Service -Name $postgresServiceName -ErrorAction SilentlyContinue
+}
+
+function Grant-PostgresServiceAccess {
+    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    if (-not (Test-Path -LiteralPath $icacls -PathType Leaf)) { throw "icacls.exe is missing: $icacls" }
+    foreach ($entry in @(
+        @($postgresInstall, '*S-1-5-20:(OI)(CI)(RX)'),
+        @($postgresData, '*S-1-5-20:(OI)(CI)(M)')
+    )) {
+        $path = $entry[0]
+        $grant = $entry[1]
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "PostgreSQL path is missing while setting service permissions: $path" }
+        & $icacls $path '/grant' $grant '/T' '/C' '/Q' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not grant the PostgreSQL service account access to $path. icacls exit code: $LASTEXITCODE" }
+    }
+}
+
+function Initialize-PostgresDataDirectoryIfNeeded {
+    $pgVersion = Join-Path $postgresData 'PG_VERSION'
+    if (Test-Path -LiteralPath $pgVersion -PathType Leaf) { return }
+    $initdb = Join-Path $postgresBin 'initdb.exe'
+    if (-not (Test-Path -LiteralPath $initdb -PathType Leaf)) { throw "PostgreSQL initdb.exe is missing: $initdb" }
+
+    if (Test-Path -LiteralPath $postgresData -PathType Container) {
+        $entries = @(Get-ChildItem -LiteralPath $postgresData -Force -ErrorAction SilentlyContinue)
+        if ($entries.Count -gt 0) {
+            $preserved = $postgresData + '.incomplete-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            Write-Warning "PostgreSQL data directory was incomplete. Preserving it at $preserved before creating a clean cluster."
+            Move-Item -LiteralPath $postgresData -Destination $preserved
+        }
+    }
+    $postgresParent = Split-Path -Parent $postgresData
+    New-Item -ItemType Directory -Path $postgresParent -Force | Out-Null
+    if (Test-Path -LiteralPath $postgresData -PathType Container) {
+        $remaining = @(Get-ChildItem -LiteralPath $postgresData -Force -ErrorAction SilentlyContinue)
+        if ($remaining.Count -eq 0) { Remove-Item -LiteralPath $postgresData -Force }
+    }
+
+    $passwordFile = Join-Path $installedHost ('.initdb-password-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    try {
+        Write-TextAtomic -Path $passwordFile -Text ($script:secrets.PostgresAdminPassword.ToString() + [Environment]::NewLine)
+        Protect-SensitiveFile -Path $passwordFile
+        Write-Host 'Initializing the private PostgreSQL data directory...' -ForegroundColor Cyan
+        & $initdb '--pgdata' $postgresData '--username' 'postgres' '--pwfile' $passwordFile '--auth-host' 'scram-sha-256' '--auth-local' 'scram-sha-256' '--encoding' 'UTF8'
+        if ($LASTEXITCODE -ne 0) { throw "initdb failed with exit code $LASTEXITCODE." }
+    } finally {
+        if (Test-Path -LiteralPath $passwordFile -PathType Leaf) { Remove-Item -LiteralPath $passwordFile -Force }
+    }
+    if (-not (Test-Path -LiteralPath $pgVersion -PathType Leaf)) { throw 'PostgreSQL initdb completed without creating PG_VERSION.' }
+}
+
+function Register-ClippyPostgresService {
+    $pgCtl = Join-Path $postgresBin 'pg_ctl.exe'
+    if (-not (Test-Path -LiteralPath $pgCtl -PathType Leaf)) { throw "PostgreSQL pg_ctl.exe is missing: $pgCtl" }
+    Initialize-PostgresDataDirectoryIfNeeded
+    Grant-PostgresServiceAccess
+    $networkServiceSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-20')
+    $networkService = $networkServiceSid.Translate([Security.Principal.NTAccount]).Value
+    Write-Host "Registering PostgreSQL service '$postgresServiceName' with $networkService..." -ForegroundColor Cyan
+    & $pgCtl 'register' '-N' $postgresServiceName '-D' $postgresData '-S' 'auto' '-U' $networkService '-o' ("-p $postgresPort")
+    if ($LASTEXITCODE -ne 0) { throw "pg_ctl could not register PostgreSQL service '$postgresServiceName'. Exit code: $LASTEXITCODE" }
+    Start-Sleep -Milliseconds 500
+    Assert-PostgresServiceOwnership
+    if (-not (Get-PostgresService)) { throw "pg_ctl reported success but PostgreSQL service '$postgresServiceName' is still missing." }
 }
 
 function Assert-PostgresServiceOwnership {
@@ -468,9 +576,17 @@ function Ensure-PostgreSQLInstalled {
     Assert-PostgresServiceOwnership
     $service = Get-PostgresService
     if (-not $service) {
+        $pgCtlCandidate = Join-Path $postgresBin 'pg_ctl.exe'
+        if ((Test-Path -LiteralPath $pgCtlCandidate -PathType Leaf) -and (Test-Path -LiteralPath $postgresInstall -PathType Container)) {
+            Write-Warning "PostgreSQL files are present but service '$postgresServiceName' is missing. Repairing the partial installation."
+            Register-ClippyPostgresService
+            $service = Get-PostgresService
+        }
+    }
+    if (-not $service) {
         if (Test-Path -LiteralPath $postgresInstall) {
             $entries = @(Get-ChildItem -LiteralPath $postgresInstall -Force -ErrorAction SilentlyContinue)
-            if ($entries.Count -gt 0) { throw "PostgreSQL install directory exists without the expected Windows service: $postgresInstall" }
+            if ($entries.Count -gt 0) { throw "PostgreSQL install directory is incomplete and cannot be repaired automatically: $postgresInstall" }
         }
         $cache = Join-Path $serverRoot 'ClippySetupCache'
         New-Item -ItemType Directory -Path $cache -Force | Out-Null
@@ -491,7 +607,6 @@ function Ensure-PostgreSQLInstalled {
             '--prefix',$postgresInstall,'--datadir',$postgresData,
             '--serverport',$postgresPort.ToString(),'--servicename',$postgresServiceName,
             '--superaccount','postgres','--superpassword',$secrets.PostgresAdminPassword.ToString(),
-            '--serviceaccount','clippy_pg_svc','--servicepassword',$secrets.PostgresAdminPassword.ToString(),
             '--enable_acledit','1',
             '--enable-components','server,commandlinetools',
             '--create_shortcuts','0'
@@ -500,7 +615,10 @@ function Ensure-PostgreSQLInstalled {
         & $installer @installArgs
         if ($LASTEXITCODE -ne 0) { throw "PostgreSQL installer failed with exit code $LASTEXITCODE." }
         Assert-PostgresServiceOwnership
-        if (-not (Get-PostgresService)) { throw "PostgreSQL installer did not create service '$postgresServiceName'." }
+        if (-not (Get-PostgresService)) {
+            Write-Warning "PostgreSQL installer completed without creating service '$postgresServiceName'. Registering the service directly with pg_ctl."
+            Register-ClippyPostgresService
+        }
     }
     foreach ($required in @($postgresPsql,$postgresCreatedb,$postgresLibpq)) {
         if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "PostgreSQL runtime file is missing: $required" }
@@ -648,8 +766,6 @@ function Assert-StagedPayloadIntegrity {
         (Join-Path $payloadRoot "$modName\keys\$keyFile") = $manifest.KeySHA256.ToString()
         (Join-Path $payloadRoot 'ServerProfileTemplate\ClippyVirtualCargo\Settings.json') = $manifest.SettingsSHA256.ToString()
         (Join-Path $payloadRoot 'ClippyStorageHost\ClippyStorageHost.exe') = $manifest.HostExeSHA256.ToString()
-        $managerScript = $manifest.ManagerSHA256.ToString()
-        $managerPowerShell = $manifest.ManagerPowerShellSHA256.ToString()
     }
     foreach ($path in $checks.Keys) {
         $expected = $checks[$path].Trim().ToUpperInvariant()
@@ -1499,8 +1615,71 @@ function Start-InstalledHost {
 function Invoke-IntegrityCheck {
     $document = Read-JsonFile -Path $installedHostConfig
     $result = Invoke-HostPost -Path '/v1/admin/integrity' -HostDocument $document
-    if (-not $result.ok -or -not $result.data.healthy) { throw 'PostgreSQL integrity check failed.' }
-    Write-Host ('PostgreSQL integrity: ' + ($result.data.results -join ', ')) -ForegroundColor Green
+
+    if (-not $result) {
+        throw 'PostgreSQL integrity check returned no response.'
+    }
+
+    $okProperty = $result.PSObject.Properties['ok']
+    if (-not $okProperty -or -not [bool]$okProperty.Value) {
+        throw 'PostgreSQL integrity check failed.'
+    }
+
+    $dataProperty = $result.PSObject.Properties['data']
+    if (-not $dataProperty -or -not $dataProperty.Value) {
+        throw 'PostgreSQL integrity response did not contain data.'
+    }
+    $data = $dataProperty.Value
+
+    $healthyProperty = $data.PSObject.Properties['healthy']
+    if (-not $healthyProperty -or -not [bool]$healthyProperty.Value) {
+        throw 'PostgreSQL integrity check reported an unhealthy database.'
+    }
+
+    $summary = New-Object System.Collections.Generic.List[string]
+
+    $checksProperty = $data.PSObject.Properties['checks']
+    if ($checksProperty -and $checksProperty.Value) {
+        foreach ($check in @($checksProperty.Value)) {
+            if (-not $check) { continue }
+
+            $nameProperty = $check.PSObject.Properties['check']
+            $errorsProperty = $check.PSObject.Properties['errors']
+
+            $name = if ($nameProperty -and $nameProperty.Value) {
+                $nameProperty.Value.ToString()
+            } else {
+                'unnamed_check'
+            }
+
+            $errors = 0
+            if ($errorsProperty -and $null -ne $errorsProperty.Value) {
+                $errors = [int64]$errorsProperty.Value
+            }
+
+            if ($errors -eq 0) {
+                $summary.Add($name + '=OK')
+            } else {
+                $summary.Add($name + '=' + $errors + ' error(s)')
+            }
+        }
+    } else {
+        # Compatibility with older host builds that returned a string array named results.
+        $resultsProperty = $data.PSObject.Properties['results']
+        if ($resultsProperty -and $resultsProperty.Value) {
+            foreach ($item in @($resultsProperty.Value)) {
+                if ($null -ne $item) {
+                    $summary.Add($item.ToString())
+                }
+            }
+        }
+    }
+
+    if ($summary.Count -eq 0) {
+        $summary.Add('healthy')
+    }
+
+    Write-Host ('PostgreSQL integrity: ' + ($summary -join ', ')) -ForegroundColor Green
     return $result
 }
 
