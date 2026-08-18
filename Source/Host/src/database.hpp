@@ -44,6 +44,8 @@ public:
     nlohmann::json incomplete_migrations(const nlohmann::json& request);
     nlohmann::json observe_migration(const nlohmann::json& request);
     nlohmann::json health();
+    nlohmann::json item_index_status();
+    nlohmann::json rebuild_item_index_batch(const nlohmann::json& request);
     nlohmann::json quick_check();
     nlohmann::json backup(const nlohmann::json& request);
     nlohmann::json metrics(const nlohmann::json& request);

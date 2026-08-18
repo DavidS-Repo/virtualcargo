@@ -1,11 +1,16 @@
+param(
+    [Parameter(Position=0,Mandatory=$false)][string]$Command = ''
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$managerScript = [IO.Path]::GetFullPath($env:CLIPPY_MANAGER_SCRIPT)
 $managerPowerShell = [IO.Path]::GetFullPath($MyInvocation.MyCommand.Path)
-$managerRoot = [IO.Path]::GetFullPath($env:CLIPPY_MANAGER_ROOT).TrimEnd('\')
-$command = $env:CLIPPY_MANAGER_COMMAND.ToLowerInvariant()
-$managerRevision = 13
+$managerRoot = if ($env:CLIPPY_MANAGER_ROOT) { [IO.Path]::GetFullPath($env:CLIPPY_MANAGER_ROOT).TrimEnd('\') } else { [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') }
+$managerScript = if ($env:CLIPPY_MANAGER_SCRIPT) { [IO.Path]::GetFullPath($env:CLIPPY_MANAGER_SCRIPT) } else { [IO.Path]::GetFullPath((Join-Path $managerRoot 'START-CLIPPY-SERVER.bat')) }
+$rawCommand = if ($Command) { $Command } elseif ($env:CLIPPY_MANAGER_COMMAND) { $env:CLIPPY_MANAGER_COMMAND } else { 'start' }
+$command = $rawCommand.ToLowerInvariant()
+$managerRevision = 16
 Write-Host "Clippy Server Manager revision $managerRevision" -ForegroundColor Cyan
 $modName = '@Clippy SQLite Virtual Cargo'
 $workshopId = '3782296362'
@@ -195,6 +200,13 @@ function Get-BuiltInConfiguration {
     "ExcludedContainerClassNames": ["ClippyVirtualCargoQuarantine", "FireplaceBase"],
     "BlockedItemClassNames": ["ExplosivesBase", "TrapBase"]
   },
+  "AdminPanel": {
+    "Enabled": true, "Port": 27817, "AutoOpenBrowser": true, "IdleShutdownMinutes": 30,
+    "HttpThreads": 8, "MaxQueuedRequests": 256, "MaxRequestBytes": 65536,
+    "PostgresPoolSize": 4, "PostgresConnectTimeoutSeconds": 3,
+    "PostgresStatementTimeoutMs": 3000, "PostgresLockTimeoutMs": 500,
+    "PostgresIdleTransactionTimeoutMs": 5000, "EnableEditing": false
+  },
   "Persistence": {
     "Path": "Auto", "MissionTemplate": "", "InstanceId": 0,
     "ColdBackupDirectory": "ClippyStorageHost/migration-backups"
@@ -312,11 +324,17 @@ if (Test-Path -LiteralPath (Join-Path $stagedPayload $modName) -PathType Contain
 }
 $payloadMod = Join-Path $payloadRoot $modName
 $payloadHost = Join-Path $payloadRoot 'ClippyStorageHost'
+$payloadAdmin = Join-Path $payloadRoot 'ClippyAdmin'
 $payloadSettings = Join-Path $payloadRoot 'ServerProfileTemplate\ClippyVirtualCargo\Settings.json'
 $installedMod = Join-Path $serverRoot $modName
 $installedHost = Join-Path $serverRoot 'ClippyStorageHost'
 $installedHostExe = Join-Path $installedHost 'ClippyStorageHost.exe'
 $installedHostConfig = Join-Path $installedHost 'ClippyStorageHost.json'
+$installedAdmin = Join-Path $serverRoot 'ClippyAdmin'
+$installedAdminExe = Join-Path $installedAdmin 'ClippyAdminHost.exe'
+$installedAdminConfig = Join-Path $installedAdmin 'ClippyAdminHost.json'
+$installedAdminLauncher = Join-Path $serverRoot 'OPEN-CLIPPY-ADMIN.bat'
+$managerAdminLauncher = Join-Path $managerRoot 'OPEN-CLIPPY-ADMIN.bat'
 $installedManager = Join-Path $serverRoot 'START-CLIPPY-SERVER.bat'
 $installedManagerPowerShell = Join-Path $serverRoot 'ClippyServerManager.ps1'
 $installedManagerConfig = Join-Path $serverRoot 'ClippyServerManager.json'
@@ -331,6 +349,8 @@ $postgresLibpq = Join-Path $postgresBin 'libpq.dll'
 $postgresServiceName = $config.PostgreSQL.ServiceName.ToString()
 $postgresPort = [int]$config.PostgreSQL.Port
 $payloadHostExe = Join-Path $payloadHost 'ClippyStorageHost.exe'
+$payloadAdminExe = Join-Path $payloadAdmin 'ClippyAdminHost.exe'
+$adminReadRole = 'clippy_virtual_cargo_admin_read'
 $script:managerState = $null
 $script:secrets = $null
 
@@ -387,14 +407,19 @@ function Get-OrCreateSecrets {
     if ($existing -and $existing.PostgresAdminPassword) { $adminPassword = $existing.PostgresAdminPassword.ToString() }
     if (-not $adminPassword) { $adminPassword = New-WindowsServicePassword }
 
-    foreach ($pair in @(@('API token',$apiToken), @('PostgreSQL application password',$appPassword), @('PostgreSQL administrator password',$adminPassword))) {
+    $adminReadPassword = ''
+    if ($existing -and $existing.PSObject.Properties['PostgresAdminReadPassword'] -and $existing.PostgresAdminReadPassword) { $adminReadPassword = $existing.PostgresAdminReadPassword.ToString() }
+    if (-not $adminReadPassword) { $adminReadPassword = New-RandomToken }
+
+    foreach ($pair in @(@('API token',$apiToken), @('PostgreSQL application password',$appPassword), @('PostgreSQL administrator password',$adminPassword), @('PostgreSQL admin read password',$adminReadPassword))) {
         if ($pair[1].Length -lt 32 -or $pair[1].Length -gt 256) { throw "$($pair[0]) must contain 32 to 256 characters." }
     }
     $document = [pscustomobject][ordered]@{
-        Version = 1
+        Version = 2
         ApiToken = $apiToken
         PostgresAppPassword = $appPassword
         PostgresAdminPassword = $adminPassword
+        PostgresAdminReadPassword = $adminReadPassword
     }
     Write-JsonAtomic -Path $installedSecrets -Document $document -Depth 10
     Protect-SensitiveFile -Path $installedSecrets
@@ -656,6 +681,22 @@ function Ensure-PostgreSQLInstalled {
     }
     Invoke-Psql -Sql "REVOKE ALL ON DATABASE $dbName FROM PUBLIC; GRANT CONNECT, TEMPORARY ON DATABASE $dbName TO $appRole;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
     Invoke-Psql -Database $dbName -Sql "REVOKE CREATE ON SCHEMA public FROM PUBLIC; REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE ON SCHEMA public TO $appRole; ALTER ROLE $appRole SET search_path TO clippy, pg_catalog;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+
+    Assert-SafePostgresName -Value $adminReadRole -Label 'Admin read PostgreSQL role' | Out-Null
+    $adminReadPassword = $secrets.PostgresAdminReadPassword.ToString()
+    if ($adminReadPassword -notmatch '^[0-9a-f]{64}$') { throw 'Generated PostgreSQL admin read password is not in its expected safe format.' }
+    $adminRoleExists = ((Invoke-Psql -Sql "SELECT 1 FROM pg_roles WHERE rolname='$adminReadRole';" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+    if ($adminRoleExists -ne '1') {
+        Invoke-Psql -Sql "SET password_encryption='scram-sha-256'; CREATE ROLE $adminReadRole LOGIN PASSWORD '$adminReadPassword' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION CONNECTION LIMIT 12;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    } else {
+        Invoke-Psql -Sql "SET password_encryption='scram-sha-256'; ALTER ROLE $adminReadRole PASSWORD '$adminReadPassword'; ALTER ROLE $adminReadRole NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION CONNECTION LIMIT 12;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    }
+    Invoke-Psql -Sql "ALTER ROLE $adminReadRole SET default_transaction_read_only=on; ALTER ROLE $adminReadRole SET search_path TO clippy, pg_catalog;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    Invoke-Psql -Sql "REVOKE ALL ON DATABASE $dbName FROM $adminReadRole; GRANT CONNECT ON DATABASE $dbName TO $adminReadRole;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    $clippySchemaExists = ((Invoke-Psql -Database $dbName -Sql "SELECT 1 FROM pg_namespace WHERE nspname='clippy';" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+    if ($clippySchemaExists -eq '1') {
+        Invoke-Psql -Database $dbName -Sql "GRANT USAGE ON SCHEMA clippy TO $adminReadRole; GRANT SELECT ON ALL TABLES IN SCHEMA clippy TO $adminReadRole; ALTER DEFAULT PRIVILEGES FOR ROLE $appRole IN SCHEMA clippy GRANT SELECT ON TABLES TO $adminReadRole;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    }
     Write-Host "PostgreSQL ready on 127.0.0.1:$postgresPort using service $postgresServiceName." -ForegroundColor Green
 }
 
@@ -667,7 +708,7 @@ function Get-PayloadHostExecutable {
         throw 'Prebuilt ClippyStorageHost.exe is unexpectedly small.'
     }
     $manifestPath = Join-Path $payloadRoot 'PAYLOAD-MANIFEST.json'
-    $expectedVersion = '0.5.0'
+    $expectedVersion = '0.5.1'
     if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
         $manifest = Read-JsonFile -Path $manifestPath
         $expectedHash = $manifest.HostExeSHA256.ToString().Trim().ToUpperInvariant()
@@ -683,6 +724,31 @@ function Get-PayloadHostExecutable {
         throw 'Prebuilt ClippyStorageHost.exe failed its version smoke test.'
     }
     return $payloadHostExe
+}
+
+function Get-PayloadAdminExecutable {
+    if (-not (Test-Path -LiteralPath $payloadAdminExe -PathType Leaf)) {
+        throw "Prebuilt ClippyAdminHost.exe is missing from the release payload: $payloadAdminExe"
+    }
+    if ((Get-Item -LiteralPath $payloadAdminExe).Length -lt 100000) {
+        throw 'Prebuilt ClippyAdminHost.exe is unexpectedly small.'
+    }
+    $manifestPath = Join-Path $payloadRoot 'PAYLOAD-MANIFEST.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Payload manifest is missing: $manifestPath" }
+    $manifest = Read-JsonFile -Path $manifestPath
+    if (-not $manifest.PSObject.Properties['AdminExeSHA256']) { throw 'Payload AdminExeSHA256 is missing.' }
+    $expectedHash = $manifest.AdminExeSHA256.ToString().Trim().ToUpperInvariant()
+    if ($expectedHash -notmatch '^[0-9A-F]{64}$') { throw 'Payload AdminExeSHA256 is invalid.' }
+    if ((Get-FileHash -LiteralPath $payloadAdminExe -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw 'Prebuilt ClippyAdminHost.exe hash does not match the release manifest.'
+    }
+    $expectedVersion = if ($manifest.PSObject.Properties['AdminVersion']) { $manifest.AdminVersion.ToString() } else { '0.5.1-alpha.1' }
+    $help = & $payloadAdminExe '--help' 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0 -or (($help | Out-String) -notmatch [regex]::Escape("ClippyAdminHost $expectedVersion"))) {
+        throw 'Prebuilt ClippyAdminHost.exe failed its version smoke test.'
+    }
+    return $payloadAdminExe
 }
 
 function Test-SqliteDatabaseFile {
@@ -756,7 +822,11 @@ function Assert-StagedPayloadIntegrity {
     $manifestPath = Join-Path $payloadRoot 'PAYLOAD-MANIFEST.json'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Staged payload manifest is missing: $manifestPath" }
     $manifest = Read-JsonFile -Path $manifestPath
-    if ($manifest.WorkshopID.ToString() -ne $workshopId -or $manifest.Version.ToString() -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw 'Staged payload identity is invalid.' }
+    $releaseVersion = $manifest.Version.ToString()
+    $workshopVersion = if ($manifest.PSObject.Properties['WorkshopVersion']) { $manifest.WorkshopVersion.ToString() } else { $releaseVersion }
+    if ($manifest.WorkshopID.ToString() -ne $workshopId -or
+        $releaseVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
+        $workshopVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw 'Staged payload identity is invalid.' }
     $signatureFile = $manifest.SignatureFile.ToString()
     $keyFile = $manifest.KeyFile.ToString()
     if ($signatureFile -notmatch '^[A-Za-z0-9_.-]+\.bisign$' -or $keyFile -notmatch '^[A-Za-z0-9_.-]+\.bikey$') { throw 'Staged payload signature or public-key filename is invalid.' }
@@ -766,6 +836,7 @@ function Assert-StagedPayloadIntegrity {
         (Join-Path $payloadRoot "$modName\keys\$keyFile") = $manifest.KeySHA256.ToString()
         (Join-Path $payloadRoot 'ServerProfileTemplate\ClippyVirtualCargo\Settings.json') = $manifest.SettingsSHA256.ToString()
         (Join-Path $payloadRoot 'ClippyStorageHost\ClippyStorageHost.exe') = $manifest.HostExeSHA256.ToString()
+        (Join-Path $payloadRoot 'ClippyAdmin\ClippyAdminHost.exe') = $manifest.AdminExeSHA256.ToString()
     }
     foreach ($path in $checks.Keys) {
         $expected = $checks[$path].Trim().ToUpperInvariant()
@@ -801,9 +872,12 @@ function Test-InstalledCurrentWorkshopMod {
     try { $workshopBuild = Read-JsonFile -Path $buildMarker } catch { return $false }
     $manifestPath = Join-Path $payloadRoot 'PAYLOAD-MANIFEST.json'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $false }
-    $releaseVersion = (Read-JsonFile -Path $manifestPath).Version.ToString()
-    if ($releaseVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { return $false }
-    if ($workshopBuild.Version.ToString() -ne $releaseVersion) { return $false }
+    $manifest = Read-JsonFile -Path $manifestPath
+    $releaseVersion = $manifest.Version.ToString()
+    $workshopVersion = if ($manifest.PSObject.Properties['WorkshopVersion']) { $manifest.WorkshopVersion.ToString() } else { $releaseVersion }
+    if ($releaseVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
+        $workshopVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { return $false }
+    if ($workshopBuild.Version.ToString() -ne $workshopVersion) { return $false }
     $expectedPboHash = $workshopBuild.PboSHA256.ToString().Trim().ToUpperInvariant()
     if ($expectedPboHash -notmatch '^[0-9A-F]{64}$') { return $false }
     return (Get-FileHash -LiteralPath $installedPbo -Algorithm SHA256).Hash -eq $expectedPboHash
@@ -811,7 +885,7 @@ function Test-InstalledCurrentWorkshopMod {
 
 function Assert-Configuration {
     foreach ($required in @($serverRoot, $serverExe, $payloadMod, $payloadHost, $payloadHostExe,
-            (Join-Path $payloadMod 'addons\clippy_virtual_cargo.pbo'), $payloadSettings)) {
+            $payloadAdmin, $payloadAdminExe, (Join-Path $payloadMod 'addons\clippy_virtual_cargo.pbo'), $payloadSettings)) {
         if (-not (Test-Path -LiteralPath $required)) { throw "Required manager path is missing: $required" }
     }
     Assert-StagedPayloadIntegrity
@@ -829,6 +903,12 @@ function Assert-Configuration {
     if ([int]$config.StorageHostSettings.MaintenancePruneBatchRows -lt 10 -or [int]$config.StorageHostSettings.MaintenancePruneBatchRows -gt 10000) { throw 'StorageHostSettings.MaintenancePruneBatchRows must be between 10 and 10000.' }
     Assert-SafePostgresName -Value $config.StorageHostSettings.PostgresDatabase.ToString() -Label 'PostgresDatabase' | Out-Null
     Assert-SafePostgresName -Value $config.StorageHostSettings.PostgresUser.ToString() -Label 'PostgresUser' | Out-Null
+    $adminPort = [int]$config.AdminPanel.Port
+    if ($adminPort -lt 1024 -or $adminPort -gt 65535) { throw 'AdminPanel.Port must be between 1024 and 65535.' }
+    if ($adminPort -eq $port -or $adminPort -eq $postgresPort) { throw 'AdminPanel.Port must be different from the storage host and PostgreSQL ports.' }
+    if ([int]$config.AdminPanel.PostgresPoolSize -lt 2 -or [int]$config.AdminPanel.PostgresPoolSize -gt 12) { throw 'AdminPanel.PostgresPoolSize must be between 2 and 12.' }
+    if ([int]$config.AdminPanel.HttpThreads -lt 2 -or [int]$config.AdminPanel.HttpThreads -gt 32) { throw 'AdminPanel.HttpThreads must be between 2 and 32.' }
+    if ([bool]$config.AdminPanel.EnableEditing) { Write-Warning 'AdminPanel.EnableEditing is ignored in the read-only alpha. No write API is compiled into ClippyAdminHost.' }
     if ([int]$config.ConfigVersion -ne 5) { throw 'Unsupported ClippyServerManager.json ConfigVersion.' }
 }
 
@@ -886,6 +966,41 @@ function Get-InstalledHostProcess {
         }
     }
     return $null
+}
+
+function Get-InstalledAdminProcess {
+    if (-not (Test-Path -LiteralPath $installedAdminExe -PathType Leaf)) { return $null }
+    $expectedPath = [IO.Path]::GetFullPath($installedAdminExe)
+    $matches = @(Get-CimInstance Win32_Process -Filter "Name='ClippyAdminHost.exe'" -ErrorAction SilentlyContinue)
+    foreach ($candidate in $matches) {
+        $pathMatches = $candidate.ExecutablePath -and
+            [IO.Path]::GetFullPath($candidate.ExecutablePath).Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)
+        $quotedExpected = '"' + $expectedPath + '"'
+        $commandMatches = $candidate.CommandLine -and
+            ($candidate.CommandLine.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+             $candidate.CommandLine.StartsWith($quotedExpected + ' ', [StringComparison]::OrdinalIgnoreCase) -or
+             $candidate.CommandLine.Equals($quotedExpected, [StringComparison]::OrdinalIgnoreCase))
+        if ($pathMatches -or $commandMatches) {
+            return Get-Process -Id $candidate.ProcessId -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($candidate in @(Get-Process -Name 'ClippyAdminHost' -ErrorAction SilentlyContinue)) {
+        try {
+            $candidatePath = $candidate.Path
+            if ($candidatePath -and
+                [IO.Path]::GetFullPath($candidatePath).Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+                return $candidate
+            }
+        } catch { }
+    }
+    return $null
+}
+
+function Stop-InstalledAdmin {
+    $process = Get-InstalledAdminProcess
+    if (-not $process) { return }
+    Stop-Process -Id $process.Id -Force -ErrorAction Stop
+    $process.WaitForExit(5000) | Out-Null
 }
 
 function Invoke-HostPost {
@@ -996,6 +1111,40 @@ function New-DesiredHostDocument {
 }
 
 
+function New-DesiredAdminDocument {
+    $secrets = Get-OrCreateSecrets
+    return [pscustomobject][ordered]@{
+        protocolVersion = 1
+        port = [int]$config.AdminPanel.Port
+        idleShutdownMinutes = [int]$config.AdminPanel.IdleShutdownMinutes
+        httpThreads = [int]$config.AdminPanel.HttpThreads
+        maxQueuedRequests = [int]$config.AdminPanel.MaxQueuedRequests
+        maxRequestBytes = [int]$config.AdminPanel.MaxRequestBytes
+        storageHostAddress = '127.0.0.1'
+        storageHostPort = [int]$config.StorageHostSettings.Port
+        postgresHost = '127.0.0.1'
+        postgresPort = [int]$config.PostgreSQL.Port
+        postgresDatabase = $config.StorageHostSettings.PostgresDatabase.ToString()
+        postgresUser = $adminReadRole
+        postgresPassword = $secrets.PostgresAdminReadPassword.ToString()
+        postgresLibraryPath = $postgresLibpq
+        postgresBinDirectory = $postgresBin
+        postgresPoolSize = [int]$config.AdminPanel.PostgresPoolSize
+        postgresConnectTimeoutSeconds = [int]$config.AdminPanel.PostgresConnectTimeoutSeconds
+        postgresStatementTimeoutMs = [int]$config.AdminPanel.PostgresStatementTimeoutMs
+        postgresLockTimeoutMs = [int]$config.AdminPanel.PostgresLockTimeoutMs
+        postgresIdleTransactionTimeoutMs = [int]$config.AdminPanel.PostgresIdleTransactionTimeoutMs
+    }
+}
+
+function Sync-InstalledAdminConfiguration {
+    New-Item -ItemType Directory -Path $installedAdmin -Force | Out-Null
+    $document = New-DesiredAdminDocument
+    Write-JsonAtomic -Path $installedAdminConfig -Document $document -Depth 20
+    Protect-SensitiveFile -Path $installedAdminConfig
+    return $document
+}
+
 function Test-HostConfigurationChanged {
     param([object]$Desired)
     if (-not (Test-Path -LiteralPath $installedHostConfig -PathType Leaf)) { return $true }
@@ -1075,6 +1224,7 @@ function Install-Payload {
     Backup-LegacyHostRuntime -LegacyDatabase $legacyDatabase
 
     $payloadHostExe = Get-PayloadHostExecutable
+    $payloadAdminExe = Get-PayloadAdminExecutable
     Ensure-PostgreSQLInstalled
 
     if (Test-InstalledCurrentWorkshopMod) {
@@ -1084,6 +1234,9 @@ function Install-Payload {
     }
     New-Item -ItemType Directory -Path $installedHost -Force | Out-Null
     Copy-Item -LiteralPath $payloadHostExe -Destination $installedHostExe -Force
+    New-Item -ItemType Directory -Path $installedAdmin -Force | Out-Null
+    Stop-InstalledAdmin
+    Copy-Item -LiteralPath $payloadAdminExe -Destination $installedAdminExe -Force
     foreach ($name in @('LICENSE.txt','THIRD-PARTY-NOTICES.md')) {
         $source = Join-Path $payloadHost $name
         if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination $installedHost -Force }
@@ -1095,6 +1248,7 @@ function Install-Payload {
 
     if (-not $managerScript.Equals($installedManager, [StringComparison]::OrdinalIgnoreCase)) { Copy-Item -LiteralPath $managerScript -Destination $installedManager -Force }
     if (-not $managerPowerShell.Equals($installedManagerPowerShell, [StringComparison]::OrdinalIgnoreCase)) { Copy-Item -LiteralPath $managerPowerShell -Destination $installedManagerPowerShell -Force }
+    if ((Test-Path -LiteralPath $managerAdminLauncher -PathType Leaf) -and -not $managerAdminLauncher.Equals($installedAdminLauncher, [StringComparison]::OrdinalIgnoreCase)) { Copy-Item -LiteralPath $managerAdminLauncher -Destination $installedAdminLauncher -Force }
     if (-not (Test-Path -LiteralPath $installedManagerConfig -PathType Leaf)) { Copy-Item -LiteralPath $configPath -Destination $installedManagerConfig -Force }
     $managerReadme = Join-Path $managerRoot 'ClippyVirtualCargoDocs\SERVER-MANAGER-README.md'
     if (-not (Test-Path -LiteralPath $managerReadme -PathType Leaf)) { $managerReadme = Join-Path $managerRoot 'SERVER-MANAGER-README.md' }
@@ -1102,6 +1256,7 @@ function Install-Payload {
 
     $desiredHostDocument = New-DesiredHostDocument
     $hostDocument = Sync-InstalledConfiguration -HostDocument $desiredHostDocument
+    Sync-InstalledAdminConfiguration | Out-Null
     Invoke-LegacySqliteMigration -LegacyDatabase $legacyDatabase
 
     $launcherLabel = if ($baseStartScript) { $baseStartScript } else { 'JSON fallback arguments' }
@@ -1612,6 +1767,217 @@ function Start-InstalledHost {
     return $process
 }
 
+function Test-ClippySchemaReady {
+    try {
+        $database = $config.StorageHostSettings.PostgresDatabase.ToString()
+        $secrets = Get-OrCreateSecrets
+        $tables = ((Invoke-Psql -Database $database -Sql "SELECT CASE WHEN to_regclass('clippy.storage_containers') IS NOT NULL AND to_regclass('clippy.cargo_roots') IS NOT NULL AND to_regclass('clippy.schema_migrations') IS NOT NULL THEN 1 ELSE 0 END;" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+        if ($tables -ne '1') { return $false }
+        $versionText = ((Invoke-Psql -Database $database -Sql "SELECT COALESCE(max(version),0) FROM clippy.schema_migrations;" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+        $version = 0
+        if (-not [int]::TryParse($versionText, [ref]$version)) { return $false }
+        return $version -ge 8
+    } catch { return $false }
+}
+
+function Test-ItemIndexComplete {
+    try {
+        $database = $config.StorageHostSettings.PostgresDatabase.ToString()
+        $secrets = Get-OrCreateSecrets
+        $exists = ((Invoke-Psql -Database $database -Sql "SELECT CASE WHEN to_regclass('clippy.cargo_item_index_state') IS NOT NULL THEN 1 ELSE 0 END;" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+        if ($exists -ne '1') { return $false }
+        $complete = ((Invoke-Psql -Database $database -Sql "SELECT CASE WHEN complete THEN 1 ELSE 0 END FROM clippy.cargo_item_index_state WHERE state_id=1;" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+        return $complete -eq '1'
+    } catch { return $false }
+}
+
+function Test-StorageRuntimeCurrent {
+    $payloadExe = Get-PayloadHostExecutable
+    if (-not (Test-Path -LiteralPath $installedHostExe -PathType Leaf)) { return $false }
+    return (Get-FileHash -LiteralPath $installedHostExe -Algorithm SHA256).Hash -eq
+        (Get-FileHash -LiteralPath $payloadExe -Algorithm SHA256).Hash
+}
+
+function Get-ItemIndexStatus {
+    param([object]$HostDocument)
+    $result = Invoke-HostPost -Path '/v1/admin/item-index/status' -HostDocument $HostDocument -TimeoutSeconds 15
+    if (-not $result.ok -or -not $result.data) { throw 'Cargo item index status query failed.' }
+    return $result.data
+}
+
+function Complete-ItemIndexBackfill {
+    param([object]$HostDocument)
+    $status = Get-ItemIndexStatus -HostDocument $HostDocument
+    if ([bool]$status.complete) {
+        Write-Host 'Cargo item index is already complete.' -ForegroundColor Green
+        return
+    }
+
+    Write-Host 'Backfilling cargo_item_index in small root batches. DayZ is stopped, so this maintenance cannot compete with gameplay storage.' -ForegroundColor Cyan
+    $totalRoots = 0L
+    $totalNodes = 0L
+    $emptyPasses = 0
+    $complete = $false
+    while (-not $complete) {
+        $batch = Invoke-HostPost -Path '/v1/admin/item-index/rebuild-batch' -HostDocument $HostDocument -Extra @{ root_limit = 4 } -TimeoutSeconds 30
+        if (-not $batch.ok -or -not $batch.data) { throw 'Cargo item index backfill batch failed.' }
+        $roots = [int64]$batch.data.roots_indexed
+        $nodes = [int64]$batch.data.nodes_indexed
+        $complete = [bool]$batch.data.complete
+        $totalRoots += $roots
+        $totalNodes += $nodes
+        if ($roots -eq 0 -and -not $complete) {
+            $emptyPasses++
+            if ($emptyPasses -gt 20) { throw 'Cargo item index backfill made no progress. Check the storage-host log before retrying.' }
+            Start-Sleep -Milliseconds 100
+        } else {
+            $emptyPasses = 0
+        }
+        if (($totalRoots % 100) -lt 4 -and $roots -gt 0) {
+            Write-Host ("Cargo item index progress: " + $totalRoots + " roots, " + $totalNodes + " nodes indexed.") -ForegroundColor DarkCyan
+        }
+    }
+    Write-Host ("Cargo item index backfill complete: " + $totalRoots + " roots, " + $totalNodes + " nodes added in this run.") -ForegroundColor Green
+}
+
+function Ensure-AdminRuntimeInstalled {
+    $payloadExe = Get-PayloadAdminExecutable
+    New-Item -ItemType Directory -Path $installedAdmin -Force | Out-Null
+    $needsCopy = -not (Test-Path -LiteralPath $installedAdminExe -PathType Leaf)
+    if (-not $needsCopy) {
+        $needsCopy = (Get-FileHash -LiteralPath $installedAdminExe -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $payloadExe -Algorithm SHA256).Hash
+    }
+    if ($needsCopy) {
+        Stop-InstalledAdmin
+        Copy-Item -LiteralPath $payloadExe -Destination $installedAdminExe -Force
+    }
+    if ((Test-Path -LiteralPath $managerAdminLauncher -PathType Leaf) -and -not $managerAdminLauncher.Equals($installedAdminLauncher, [StringComparison]::OrdinalIgnoreCase)) {
+        Copy-Item -LiteralPath $managerAdminLauncher -Destination $installedAdminLauncher -Force
+    }
+}
+
+function Wait-AdminReady {
+    param([int]$Port)
+    $deadline = [DateTime]::UtcNow.AddSeconds([int]$config.Management.HealthTimeoutSeconds)
+    do {
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri ("http://127.0.0.1:$Port/") -TimeoutSec 2
+            if ([int]$response.StatusCode -eq 200) { return }
+        } catch { }
+        Start-Sleep -Milliseconds 200
+    } until ([DateTime]::UtcNow -ge $deadline)
+    throw "ClippyAdminHost did not become ready on 127.0.0.1:$Port."
+}
+
+function Start-ClippyAdminPanel {
+    Assert-Configuration
+    if (-not [bool]$config.AdminPanel.Enabled) { throw 'AdminPanel.Enabled is false in ClippyServerManager.json.' }
+
+    $dayZ = Get-DayZProcess
+    $missingStorageRuntime = -not (Test-Path -LiteralPath $installedHostExe -PathType Leaf) -or -not (Test-Path -LiteralPath $installedHostConfig -PathType Leaf)
+    $storageRuntimeCurrent = $false
+
+    if ($missingStorageRuntime) {
+        if ($dayZ) { throw 'The Clippy storage runtime is not installed. Stop DayZ once and run the install command before opening the admin panel.' }
+        Install-Payload | Out-Null
+        $storageRuntimeCurrent = $true
+    } else {
+        $storageRuntimeCurrent = Test-StorageRuntimeCurrent
+        if (-not $storageRuntimeCurrent) {
+            if ($dayZ) {
+                Write-Warning 'The installed ClippyStorageHost is older than this payload. It will not be replaced while DayZ is running. Nested class search will stay in the safe fallback mode until the server is stopped and the payload is installed.'
+                Ensure-PostgreSQLInstalled
+                Ensure-AdminRuntimeInstalled
+                Sync-InstalledAdminConfiguration | Out-Null
+            } else {
+                Install-Payload | Out-Null
+                $storageRuntimeCurrent = $true
+            }
+        } else {
+            Ensure-PostgreSQLInstalled
+            Ensure-AdminRuntimeInstalled
+            Sync-InstalledAdminConfiguration | Out-Null
+        }
+    }
+
+    $schemaReady = Test-ClippySchemaReady
+    $startedHostForMaintenance = $false
+    if (-not $schemaReady) {
+        if ($dayZ) {
+            Write-Warning 'PostgreSQL is still on the pre-index schema while DayZ is running. The admin panel will remain read-only and use its bounded fallback search until the next stopped-server install.'
+        } elseif ($storageRuntimeCurrent) {
+            $hostProcess = Get-InstalledHostProcess
+            if (-not $hostProcess) {
+                Start-InstalledHost | Out-Null
+                $startedHostForMaintenance = $true
+            } else {
+                $document = Read-JsonFile -Path $installedHostConfig
+                Wait-HostHealthy -HostDocument $document | Out-Null
+            }
+            if (-not (Test-ClippySchemaReady)) { throw 'Clippy PostgreSQL schema did not migrate to version 8.' }
+            Ensure-PostgreSQLInstalled
+            $schemaReady = $true
+        }
+    }
+
+    if ($schemaReady -and $storageRuntimeCurrent -and -not (Test-ItemIndexComplete)) {
+        if ($dayZ) {
+            Write-Warning 'cargo_item_index backfill is incomplete. It is not being rebuilt while DayZ is running. Existing root search and exact item-ID lookup remain available.'
+        } else {
+            $hostProcess = Get-InstalledHostProcess
+            if (-not $hostProcess) {
+                Start-InstalledHost | Out-Null
+                $startedHostForMaintenance = $true
+            }
+            $document = Read-JsonFile -Path $installedHostConfig
+            Wait-HostHealthy -HostDocument $document | Out-Null
+            try {
+                Complete-ItemIndexBackfill -HostDocument $document
+            } catch {
+                Write-Warning ("cargo_item_index backfill did not complete: " + $_.Exception.Message + ". The admin panel will keep using its safe fallback search.")
+            }
+        }
+    }
+
+    if ($startedHostForMaintenance -and -not $dayZ) {
+        Stop-InstalledHost -AllowForce
+    }
+
+    Ensure-AdminRuntimeInstalled
+    Sync-InstalledAdminConfiguration | Out-Null
+    Stop-InstalledAdmin
+
+    $token = New-RandomToken
+    $bootstrapFile = Join-Path $installedAdmin ('.admin-bootstrap-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    Write-TextAtomic -Path $bootstrapFile -Text $token
+    Protect-SensitiveFile -Path $bootstrapFile
+
+    $logRoot = Resolve-AbsolutePath -Value $config.Management.LogDirectory.ToString() -Base $serverRoot
+    New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+    $stdout = Join-Path $logRoot 'ClippyAdminHost.stdout.log'
+    $stderr = Join-Path $logRoot 'ClippyAdminHost.stderr.log'
+    $process = $null
+    try {
+        $process = Start-Process -FilePath $installedAdminExe -ArgumentList '--config','ClippyAdminHost.json','--bootstrap-file',[IO.Path]::GetFileName($bootstrapFile) -WorkingDirectory $installedAdmin -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+        Wait-AdminReady -Port ([int]$config.AdminPanel.Port)
+    } catch {
+        if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $bootstrapFile -PathType Leaf) { Remove-Item -LiteralPath $bootstrapFile -Force }
+        throw
+    }
+
+    $url = "http://127.0.0.1:$([int]$config.AdminPanel.Port)/#bootstrap=$token"
+    if ($env:CLIPPY_ADMIN_URL_FILE) {
+        Write-TextAtomic -Path $env:CLIPPY_ADMIN_URL_FILE -Text ($url + [Environment]::NewLine)
+        Protect-SensitiveFile -Path $env:CLIPPY_ADMIN_URL_FILE
+    } elseif ([bool]$config.AdminPanel.AutoOpenBrowser) {
+        Start-Process $url | Out-Null
+    }
+    Write-Host "Clippy Admin Panel started on 127.0.0.1:$([int]$config.AdminPanel.Port), PID $($process.Id)." -ForegroundColor Green
+    Write-Host 'Admin Panel Alpha is read-only. PostgreSQL remains private on loopback.' -ForegroundColor Green
+}
+
 function Invoke-IntegrityCheck {
     $document = Read-JsonFile -Path $installedHostConfig
     $result = Invoke-HostPost -Path '/v1/admin/integrity' -HostDocument $document
@@ -1694,8 +2060,10 @@ function Invoke-OnlineBackup {
 function Show-Status {
     $dayZ = Get-DayZProcess
     $hostProcess = Get-InstalledHostProcess
+    $adminProcess = Get-InstalledAdminProcess
     Write-Host ('DayZ: ' + $(if ($dayZ) { "running, PID $($dayZ.Id)" } else { 'stopped' }))
     Write-Host ('Storage host: ' + $(if ($hostProcess) { "running, PID $($hostProcess.Id)" } else { 'stopped' }))
+    Write-Host ('Admin panel: ' + $(if ($adminProcess) { "running, PID $($adminProcess.Id)" } else { 'stopped' }))
     if ($hostProcess -and (Test-Path -LiteralPath $installedHostConfig -PathType Leaf)) {
         if (-not $script:managerState) { Initialize-ManagerState | Out-Null }
         $document = Read-JsonFile -Path $installedHostConfig
@@ -1720,6 +2088,17 @@ function Start-ManagedServer {
     if ([bool]$config.Management.InstallOrUpdatePayloadOnStart) { $hostDocument = Install-Payload } else { $hostDocument = Sync-InstalledConfiguration }
     Run-WorkshopUpdater
     $hostProcess = Start-InstalledHost
+    if ((Test-ClippySchemaReady) -and -not (Test-ItemIndexComplete)) {
+        if (Test-StorageRuntimeCurrent) {
+            try {
+                Complete-ItemIndexBackfill -HostDocument $hostDocument
+            } catch {
+                Write-Warning ("cargo_item_index backfill did not complete: " + $_.Exception.Message + ". DayZ startup will continue and the admin panel will use fallback search until the index can be rebuilt.")
+            }
+        } else {
+            Write-Warning 'cargo_item_index backfill is incomplete, but the installed StorageHost is older than this payload. Backfill is deferred until the current payload is installed.'
+        }
+    }
     if ([bool]$config.Management.RunIntegrityCheck) { Invoke-IntegrityCheck | Out-Null }
     if ([bool]$config.Management.BackupBeforeServerStart) { Invoke-OnlineBackup | Out-Null }
     $argumentText = Get-ManagedArgumentText
@@ -1773,6 +2152,7 @@ switch ($command) {
         Install-Payload | Out-Null
     }
     'status' { Show-Status }
+    'admin' { Start-ClippyAdminPanel }
     'check' {
         if (-not (Get-InstalledHostProcess)) { Start-InstalledHost | Out-Null }
         Invoke-IntegrityCheck | Out-Null
@@ -1793,13 +2173,14 @@ switch ($command) {
         Write-Host 'Configuration and payload validation passed.' -ForegroundColor Green
         Write-Host "Server root: $serverRoot"
         Write-Host "Host port: $($config.StorageHostSettings.Port)"
+        Write-Host "Admin port: $($config.AdminPanel.Port)"
         Write-Host "Persistence: $($plan.Persistence.HivePath)"
         Write-Host "Detection: $($plan.State.Classification)"
         Write-Host ('Automatic existing-cargo migration: ' + $(if ([bool]$plan.State.RequiresExistingCargoMigration) { 'required' } else { 'not required' }))
         Write-Host "Generated arguments: $arguments"
     }
     'help' {
-        Write-Host 'Commands: start, install, status, check, backup, stop-host, validate, help'
+        Write-Host 'Commands: start, install, admin, status, check, backup, stop-host, validate, help'
         Write-Host 'Edit ClippyServerManager.json to change server, port, database, launch, persistence, and backup settings.'
     }
     default { throw "Unknown manager command '$command'. Use help for the command list." }

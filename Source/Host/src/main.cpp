@@ -17,7 +17,7 @@
 namespace {
 
 using nlohmann::json;
-constexpr const char* host_version = "0.5.0";
+constexpr const char* host_version = "0.5.1";
 constexpr const char* protocol_version = "1.0";
 
 std::atomic<bool> stopping = false;
@@ -221,6 +221,8 @@ int main(int argc, char** argv) {
         server.Post("/v1/migration/ack-cleaned", endpoint(config, [&database](const json& body) { return database.acknowledge_migration_cleanup(body); }));
         server.Post("/v1/migration/incomplete", endpoint(config, [&database](const json& body) { return database.incomplete_migrations(body); }));
         server.Post("/v1/migration/observe", endpoint(config, [&database](const json& body) { return database.observe_migration(body); }));
+        server.Post("/v1/admin/item-index/status", endpoint(config, [&database](const json&) { return database.item_index_status(); }));
+        server.Post("/v1/admin/item-index/rebuild-batch", endpoint(config, [&database](const json& body) { return database.rebuild_item_index_batch(body); }));
         server.Post("/v1/admin/integrity", endpoint(config, [&database](const json&) { return database.quick_check(); }));
         server.Post("/v1/admin/backup", endpoint(config, [&database](const json& body) { return database.backup(body); }));
         server.Post("/v1/admin/checkpoint", endpoint(config, [&database](const json&) {

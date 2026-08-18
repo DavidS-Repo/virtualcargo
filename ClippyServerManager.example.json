@@ -17,5 +17,12 @@
       "ClippyVirtualCargoQuarantine",
       "FireplaceBase"
     ]
+  },
+  "AdminPanel": {
+    "Enabled": true,
+    "Port": 27817,
+    "AutoOpenBrowser": true,
+    "IdleShutdownMinutes": 30,
+    "EnableEditing": false
   }
 }

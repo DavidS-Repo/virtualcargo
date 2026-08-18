@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(ClippyStorageHost VERSION 0.5.0 LANGUAGES C CXX)
+project(ClippyStorageHost VERSION 0.5.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

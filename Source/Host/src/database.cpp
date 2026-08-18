@@ -33,7 +33,7 @@ using nlohmann::json;
 
 namespace {
 
-constexpr int schema_version = 7;
+constexpr int schema_version = 8;
 
 std::string required_string(const json& value, const char* key, std::size_t maximum = 512) {
     if (!value.contains(key) || !value[key].is_string()) {
@@ -305,6 +305,67 @@ std::size_t collect_item_ids(const json& node, json& ids) {
     std::size_t count = 1;
     for (const auto& child : node.at("children")) count += collect_item_ids(child, ids);
     return count;
+}
+
+void collect_item_index_rows(const std::string& storage_id,
+                             const std::string& root_item_id,
+                             const json& node,
+                             const std::string& parent_item_id,
+                             int depth,
+                             std::int64_t updated_ms,
+                             json& rows) {
+    if (!node.is_object()) throw std::runtime_error("Stored cargo tree contains a non-object node.");
+    const auto item_id = node.value("item_id", "");
+    const auto class_name = node.value("class_name", "");
+    if (item_id.empty() || class_name.empty()) {
+        throw std::runtime_error("Stored cargo tree is missing item_id or class_name while rebuilding the item index.");
+    }
+    const auto adapter_id = node.contains("adapter") && node["adapter"].is_object()
+        ? node["adapter"].value("id", "") : "";
+    const auto location_type = node.contains("location") && node["location"].is_object()
+        ? node["location"].value("kind", "") : "";
+    rows.push_back({
+        {"storage_id", storage_id},
+        {"root_item_id", root_item_id},
+        {"item_id", item_id},
+        {"parent_item_id", parent_item_id.empty() ? json(nullptr) : json(parent_item_id)},
+        {"depth", depth},
+        {"class_name", class_name},
+        {"quantity", node.value("quantity", 0.0)},
+        {"health", node.value("health", 0.0)},
+        {"adapter_id", adapter_id},
+        {"location_type", location_type},
+        {"search_state_json", node.contains("state") && node["state"].is_object() ? node["state"] : json::object()},
+        {"updated_ms", updated_ms}
+    });
+    if (!node.contains("children")) return;
+    if (!node["children"].is_array()) {
+        throw std::runtime_error("Stored cargo tree has a non-array children field while rebuilding the item index.");
+    }
+    for (const auto& child : node["children"]) {
+        collect_item_index_rows(storage_id, root_item_id, child, item_id, depth + 1, updated_ms, rows);
+    }
+}
+
+std::size_t insert_item_index_rows(PgPool* database, const json& rows) {
+    if (!rows.is_array() || rows.empty()) return 0;
+    Statement insert(database, R"SQL(
+INSERT INTO cargo_item_index(
+    storage_id,root_item_id,item_id,parent_item_id,depth,class_name,quantity,health,
+    adapter_id,location_type,search_state_json,updated_ms
+)
+SELECT x.storage_id,x.root_item_id,x.item_id,x.parent_item_id,x.depth,x.class_name,x.quantity,x.health,
+       x.adapter_id,x.location_type,x.search_state_json,x.updated_ms
+FROM jsonb_to_recordset(?1::jsonb) AS x(
+    storage_id text,root_item_id text,item_id text,parent_item_id text,depth integer,class_name text,
+    quantity double precision,health double precision,adapter_id text,location_type text,
+    search_state_json jsonb,updated_ms bigint
+)
+ON CONFLICT(storage_id,root_item_id,item_id) DO NOTHING
+)SQL");
+    insert.bind(1, rows.dump());
+    insert.done();
+    return static_cast<std::size_t>(insert.affected_rows());
 }
 
 class ItemInserter {
@@ -621,6 +682,91 @@ CREATE TABLE IF NOT EXISTS cargo_roots(
 ) WITH (autovacuum_vacuum_scale_factor=0.05, autovacuum_analyze_scale_factor=0.02, toast.autovacuum_vacuum_scale_factor=0.05);
 CREATE INDEX IF NOT EXISTS cargo_roots_item_ids
     ON cargo_roots USING GIN(item_ids);
+CREATE INDEX IF NOT EXISTS cargo_roots_class_prefix
+    ON cargo_roots((lower(class_name)) text_pattern_ops,storage_id,root_item_id);
+
+CREATE TABLE IF NOT EXISTS cargo_item_index(
+    storage_id TEXT NOT NULL,
+    root_item_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    parent_item_id TEXT,
+    depth INTEGER NOT NULL CHECK(depth >= 0),
+    class_name TEXT NOT NULL,
+    quantity DOUBLE PRECISION NOT NULL CHECK(quantity >= 0 AND quantity <> 'NaN'::float8 AND quantity <> 'Infinity'::float8),
+    health DOUBLE PRECISION NOT NULL CHECK(health >= 0 AND health <> 'NaN'::float8 AND health <> 'Infinity'::float8),
+    adapter_id TEXT NOT NULL,
+    location_type TEXT NOT NULL,
+    search_state_json JSONB NOT NULL,
+    updated_ms BIGINT NOT NULL,
+    PRIMARY KEY(storage_id,root_item_id,item_id),
+    FOREIGN KEY(storage_id,root_item_id) REFERENCES cargo_roots(storage_id,root_item_id) ON DELETE CASCADE
+) WITH (autovacuum_vacuum_scale_factor=0.05, autovacuum_analyze_scale_factor=0.02);
+CREATE INDEX IF NOT EXISTS cargo_item_index_item_lookup
+    ON cargo_item_index(item_id,storage_id,root_item_id);
+CREATE INDEX IF NOT EXISTS cargo_item_index_class_prefix
+    ON cargo_item_index((lower(class_name)) text_pattern_ops,storage_id,root_item_id,item_id);
+CREATE INDEX IF NOT EXISTS cargo_item_index_storage
+    ON cargo_item_index(storage_id,root_item_id,depth,item_id);
+
+CREATE TABLE IF NOT EXISTS cargo_item_index_state(
+    state_id SMALLINT PRIMARY KEY CHECK(state_id=1),
+    complete BOOLEAN NOT NULL,
+    indexed_roots BIGINT NOT NULL DEFAULT 0 CHECK(indexed_roots >= 0),
+    updated_ms BIGINT NOT NULL,
+    last_error TEXT
+);
+INSERT INTO cargo_item_index_state(state_id,complete,indexed_roots,updated_ms,last_error)
+SELECT 1,NOT EXISTS(SELECT 1 FROM cargo_roots),0,0,NULL
+ON CONFLICT(state_id) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION clippy.refresh_cargo_item_index()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    DELETE FROM cargo_item_index
+    WHERE storage_id=NEW.storage_id AND root_item_id=NEW.root_item_id;
+
+    INSERT INTO cargo_item_index(
+        storage_id,root_item_id,item_id,parent_item_id,depth,class_name,quantity,health,
+        adapter_id,location_type,search_state_json,updated_ms
+    )
+    WITH RECURSIVE nodes(node,parent_item_id,depth) AS (
+        SELECT NEW.tree_json,NULL::text,0
+        UNION ALL
+        SELECT child.value,nodes.node->>'item_id',nodes.depth+1
+        FROM nodes
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE
+                WHEN jsonb_typeof(nodes.node->'children')='array' THEN nodes.node->'children'
+                ELSE '[]'::jsonb
+            END
+        ) AS child(value)
+    )
+    SELECT
+        NEW.storage_id,
+        NEW.root_item_id,
+        node->>'item_id',
+        parent_item_id,
+        depth,
+        node->>'class_name',
+        COALESCE((node->>'quantity')::double precision,0),
+        COALESCE((node->>'health')::double precision,0),
+        COALESCE(node#>>'{adapter,id}',''),
+        COALESCE(node#>>'{location,kind}',''),
+        COALESCE(node->'state','{}'::jsonb),
+        NEW.created_ms
+    FROM nodes
+    WHERE jsonb_typeof(node)='object' AND node ? 'item_id' AND node ? 'class_name';
+
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS cargo_roots_refresh_item_index ON cargo_roots;
+CREATE TRIGGER cargo_roots_refresh_item_index
+AFTER INSERT OR UPDATE OF tree_json ON cargo_roots
+FOR EACH ROW EXECUTE FUNCTION clippy.refresh_cargo_item_index();
 
 CREATE TABLE IF NOT EXISTS operations(
     operation_id TEXT PRIMARY KEY,
@@ -1737,6 +1883,115 @@ json StorageDatabase::health() {
             {"connection_pool_size", static_cast<std::int64_t>(pool_->size())}};
 }
 
+json StorageDatabase::item_index_status() {
+    auto& slot = reader();
+    std::lock_guard lock(slot.mutex);
+    Transaction transaction(slot.connection, "BEGIN READ ONLY");
+    Statement state(slot.connection,
+        "SELECT complete,indexed_roots,updated_ms,last_error,"
+        "COALESCE((SELECT GREATEST(reltuples,0)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='clippy' AND c.relname='cargo_roots'),0),"
+        "COALESCE((SELECT GREATEST(reltuples,0)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='clippy' AND c.relname='cargo_item_index'),0) "
+        "FROM cargo_item_index_state WHERE state_id=1");
+    if (!state.row()) throw std::runtime_error("Cargo item index state row is missing.");
+    json result = {
+        {"available", true},
+        {"complete", state.text(0) == "t"},
+        {"indexed_roots", state.integer(1)},
+        {"updated_ms", state.integer(2)},
+        {"root_count_estimated", state.integer(4)},
+        {"indexed_nodes_estimated", state.integer(5)}
+    };
+    if (!state.is_null(3)) result["last_error"] = state.text(3);
+    transaction.commit();
+    return result;
+}
+
+json StorageDatabase::rebuild_item_index_batch(const json& request) {
+    int root_limit = 4;
+    if (request.contains("root_limit")) {
+        if (!request["root_limit"].is_number_integer()) {
+            throw ApiError(400, "invalid_request", "root_limit must be an integer.");
+        }
+        root_limit = request["root_limit"].get<int>();
+    }
+    if (root_limit < 1 || root_limit > 8) {
+        throw ApiError(400, "invalid_request", "root_limit must be between 1 and 8.");
+    }
+
+    std::lock_guard lock(writer_gate_);
+    Transaction transaction(writer_);
+    Statement roots(writer_, R"SQL(
+SELECT r.storage_id,r.root_item_id,r.tree_json::text,r.created_ms
+FROM cargo_roots r
+WHERE NOT EXISTS(
+    SELECT 1 FROM cargo_item_index i
+    WHERE i.storage_id=r.storage_id AND i.root_item_id=r.root_item_id
+)
+ORDER BY r.storage_id,r.root_item_id
+LIMIT ?1
+FOR UPDATE OF r SKIP LOCKED
+)SQL");
+    roots.bind(1, static_cast<std::int64_t>(root_limit));
+
+    struct PendingRoot {
+        std::string storage_id;
+        std::string root_item_id;
+        json tree;
+        std::int64_t updated_ms = 0;
+    };
+    std::vector<PendingRoot> pending;
+    while (roots.row()) {
+        pending.push_back({
+            roots.text(0),
+            roots.text(1),
+            json::parse(roots.text(2)),
+            roots.integer(3)
+        });
+    }
+
+    std::size_t nodes_indexed = 0;
+    for (const auto& root : pending) {
+        json rows = json::array();
+        collect_item_index_rows(root.storage_id, root.root_item_id, root.tree, "", 0, root.updated_ms, rows);
+        const auto inserted = insert_item_index_rows(writer_, rows);
+        if (inserted != rows.size()) {
+            throw std::runtime_error("Cargo item index backfill did not insert every node for a locked root.");
+        }
+        nodes_indexed += inserted;
+    }
+
+    Statement remaining(writer_, R"SQL(
+SELECT EXISTS(
+    SELECT 1
+    FROM cargo_roots r
+    WHERE NOT EXISTS(
+        SELECT 1 FROM cargo_item_index i
+        WHERE i.storage_id=r.storage_id AND i.root_item_id=r.root_item_id
+    )
+    LIMIT 1
+)
+)SQL");
+    if (!remaining.row()) throw std::runtime_error("Cargo item index completeness query returned no row.");
+    const bool complete = remaining.text(0) != "t";
+    Statement update(writer_,
+        "UPDATE cargo_item_index_state "
+        "SET complete=?1,indexed_roots=indexed_roots+?2,updated_ms=?3,last_error=NULL "
+        "WHERE state_id=1");
+    update.bind(1, std::string(complete ? "true" : "false"));
+    update.bind(2, static_cast<std::int64_t>(pending.size()));
+    update.bind(3, now_unix_ms());
+    update.done();
+    transaction.commit();
+
+    return {
+        {"roots_indexed", static_cast<std::int64_t>(pending.size())},
+        {"nodes_indexed", static_cast<std::int64_t>(nodes_indexed)},
+        {"complete", complete}
+    };
+}
+
 json StorageDatabase::quick_check() {
     auto& slot = reader();
     std::lock_guard lock(slot.mutex);
@@ -1770,6 +2025,15 @@ json StorageDatabase::quick_check() {
                "UNION ALL SELECT storage_id FROM cargo_sessions WHERE status IN ('OPEN','MATERIALIZED','COMMITTED') "
                "UNION ALL SELECT storage_id FROM cargo_migrations WHERE status IN ('PREPARED','COMMITTED')"
                ") active GROUP BY storage_id HAVING count(*)>1) conflicts");
+    Statement index_state(slot.connection, "SELECT complete FROM cargo_item_index_state WHERE state_id=1");
+    if (!index_state.row()) throw std::runtime_error("Cargo item index state row is missing.");
+    const bool item_index_complete = index_state.text(0) == "t";
+    if (item_index_complete) {
+        check_zero("cargo_item_index_node_counts",
+                   "SELECT count(*) FROM cargo_roots r LEFT JOIN ("
+                   "SELECT storage_id,root_item_id,count(*) AS indexed_nodes FROM cargo_item_index GROUP BY storage_id,root_item_id"
+                   ") i USING(storage_id,root_item_id) WHERE COALESCE(i.indexed_nodes,0)<>r.node_count");
+    }
     Statement app(slot.connection,
         "SELECT count(*) FROM application_meta WHERE key='application' AND value='ClippyVirtualCargo'");
     if (!app.row() || app.integer(0) != 1) {
@@ -1779,7 +2043,7 @@ json StorageDatabase::quick_check() {
         checks.push_back({{"check", "application_marker"}, {"errors", 0}});
     }
     transaction.commit();
-    return {{"healthy", healthy}, {"checks", std::move(checks)},
+    return {{"healthy", healthy}, {"checks", std::move(checks)}, {"item_index_complete", item_index_complete},
             {"note", "PostgreSQL enforces foreign keys and checks on every write; this endpoint validates Clippy logical invariants."}};
 }
 
