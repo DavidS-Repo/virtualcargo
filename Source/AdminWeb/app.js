@@ -69,7 +69,6 @@
   function shell() {
     app.innerHTML = `<div class="shell">
       <aside class="sidebar">
-        <div class="brand"><span class="brand-mark">C</span><span>Clippy Admin</span></div>
         <nav class="nav" aria-label="Admin pages">
           ${navButton('overview','Overview')}${navButton('containers','Containers')}${navButton('items','Items')}${navButton('sessions','Sessions')}${navButton('recovery','Recovery')}${navButton('database','Database')}
         </nav>

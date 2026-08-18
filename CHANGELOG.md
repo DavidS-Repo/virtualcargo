@@ -2,6 +2,8 @@
 
 ## 0.5.1
 
+- Fixed `OPEN-CLIPPY-ADMIN.bat` failing to launch `ClippyAdminHost.exe` on Windows PowerShell because the bootstrap arguments were bound incorrectly by `Start-Process`.
+- Removed the redundant Clippy Admin branding block from the main admin-panel sidebar.
 - Added the Clippy Admin Panel Alpha with a localhost-only authenticated browser session, embedded offline UI, Overview, Containers, inventory trees, bounded item search, Sessions, Recovery, and Database pages.
 - Added a dedicated PostgreSQL read-only login and separate admin connection pool. Admin editing remains disabled.
 - Added `OPEN-CLIPPY-ADMIN.bat`, the server-manager `admin` command, admin executable payload hashing, and exact Server Ready packaging rules.

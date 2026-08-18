@@ -1959,7 +1959,13 @@ function Start-ClippyAdminPanel {
     $stderr = Join-Path $logRoot 'ClippyAdminHost.stderr.log'
     $process = $null
     try {
-        $process = Start-Process -FilePath $installedAdminExe -ArgumentList '--config','ClippyAdminHost.json','--bootstrap-file',[IO.Path]::GetFileName($bootstrapFile) -WorkingDirectory $installedAdmin -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+        $adminArguments = @(
+            '--config'
+            'ClippyAdminHost.json'
+            '--bootstrap-file'
+            ([IO.Path]::GetFileName($bootstrapFile))
+        )
+        $process = Start-Process -FilePath $installedAdminExe -ArgumentList $adminArguments -WorkingDirectory $installedAdmin -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
         Wait-AdminReady -Port ([int]$config.AdminPanel.Port)
     } catch {
         if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
