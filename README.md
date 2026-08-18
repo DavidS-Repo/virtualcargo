@@ -11,7 +11,7 @@ The repository includes the built Windows storage host, the signed Workshop mod,
 3. Edit `ClippyServerManager.example.json` if you need different server launch settings or container exclusions.
 4. Run `START-CLIPPY-SERVER.bat`.
 
-The manager installs a private local PostgreSQL instance when needed. If it finds an older Clippy SQLite database, it keeps a safety copy and imports the data into PostgreSQL before the server starts.
+The manager installs a private local PostgreSQL instance when needed. PostgreSQL program files stay with the server, while writable database data is kept under `%ProgramData%\ClippyVirtualCargo\PostgreSQL\data` on Windows. If it finds an older Clippy SQLite database, it keeps a safety copy and imports the data into PostgreSQL before the server starts.
 
 ## Container support
 

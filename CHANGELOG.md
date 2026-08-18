@@ -2,6 +2,8 @@
 
 ## 0.5.0
 
+- Fixed Windows setup so a partial PostgreSQL install with a missing service is repaired automatically.
+
 - Changed the default container policy to auto-discover top-level cargo containers, including compatible modded storage.
 - Enabled vehicle cargo by default for fresh installs.
 - Changed class exclusions to match inherited classes, so excluding a base class also blocks its subclasses.
