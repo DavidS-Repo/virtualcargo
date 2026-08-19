@@ -1191,6 +1191,7 @@ class CVCContainerService
         if (item)
         {
             item.CVCSetActionState(actionState);
+            SyncMovementLock(container);
             return;
         }
         CarScript vehicle = CarScript.Cast(container);
@@ -1205,6 +1206,28 @@ class CVCContainerService
         ItemBase item = ItemBase.Cast(container);
         if (item)
             item.CVCSetManagedShell(managed);
+    }
+
+    static bool ShouldLockMovement(EntityAI container)
+    {
+        if (!container || !s_EnforcementReady || !CVCContainerPolicy.IsEligible(container))
+            return false;
+        string key = CVCContainerPolicy.ProviderKey(container);
+        if (key == "")
+            return false;
+        CVCContainerRuntime state;
+        if (!s_States.Find(key, state) || !state || state.physical_fallback)
+            return false;
+        return state.busy || state.phase != PHASE_IDLE || state.recovering || state.session_id != "" || state.active_migration != null || state.migration_prepare_dispatched || state.migration_retries > 0;
+    }
+
+    static void SyncMovementLock(EntityAI container)
+    {
+        if (!GetGame().IsServer() || !container)
+            return;
+        ItemBase item = ItemBase.Cast(container);
+        if (item)
+            item.CVCSetMovementLocked(ShouldLockMovement(container));
     }
 
     static void QueueMaterialization(CVCContainerRuntime state, CVCSessionData session, CVCSessionJournalEntry journal)
@@ -1515,6 +1538,7 @@ class CVCContainerService
         state.player = null;
         state.migration_retries = 0;
         SetManagedLifecycle(container, false);
+        SyncMovementLock(container);
         SetActionState(container, ACTION_NONE);
         ErrorEx("[Clippy Virtual Cargo] Using vanilla physical cargo for " + state.provider_key + " until the next server restart: " + reason);
         return true;
@@ -2836,6 +2860,7 @@ class CVCMigrationService
         state.migration_retries = 0;
         state.busy = true;
         state.phase = CVCContainerService.PHASE_MIGRATING;
+        CVCContainerService.SyncMovementLock(state.container);
         s_InFlight++;
         if (state.storage_id == "")
         {
@@ -3135,6 +3160,7 @@ class CVCMigrationService
             state.active_migration = null;
             if (state.container)
             {
+                CVCContainerService.SyncMovementLock(state.container);
                 Observe(state.container, status, PhysicalRootCount(state.container), 0, 0, detail);
                 if (requeue)
                     Enqueue(state.container);
@@ -3156,6 +3182,8 @@ class CVCMigrationService
             state.busy = false;
             state.phase = CVCContainerService.PHASE_IDLE;
             state.migration_retries++;
+            if (state.container)
+                CVCContainerService.SyncMovementLock(state.container);
         }
         if (s_InFlight > 0)
             s_InFlight--;
@@ -3185,6 +3213,7 @@ class CVCMigrationService
         }
         state.busy = true;
         state.phase = CVCContainerService.PHASE_MIGRATING;
+        CVCContainerService.SyncMovementLock(state.container);
         s_InFlight++;
         if (state.active_migration)
         {
@@ -3267,7 +3296,11 @@ class CVCMigrationService
     }
 }
 
-class ActionCVCOpenNativeCargo: ActionSingleUseBase
+// Clippy container actions are world-object interactions, not held-item single-use actions.
+// Keeping them on InteractActionInput prevents them from competing with vanilla
+// target-player actions such as feeding medicine to another survivor. ActionInteractBase
+// does not use the held item, so these actions must not require empty hands.
+class ActionCVCOpenNativeCargo: ActionInteractBase
 {
     void ActionCVCOpenNativeCargo() { m_Text = "Open virtual cargo"; }
     override void CreateConditionComponents()
@@ -3279,8 +3312,8 @@ class ActionCVCOpenNativeCargo: ActionSingleUseBase
     {
         EntityAI container = EntityAI.Cast(target.GetObject());
         if (!GetGame().IsServer())
-            return !item && CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.CanOpen(container);
-        return !item && CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.CanOpen(container);
+            return CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.CanOpen(container);
+        return CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.CanOpen(container);
     }
     override void OnExecuteServer(ActionData action_data)
     {
@@ -3288,7 +3321,7 @@ class ActionCVCOpenNativeCargo: ActionSingleUseBase
     }
 }
 
-class ActionCVCOpenNextPage: ActionSingleUseBase
+class ActionCVCOpenNextPage: ActionInteractBase
 {
     void ActionCVCOpenNextPage() { m_Text = "Open next virtual cargo page"; }
     override void CreateConditionComponents()
@@ -3300,8 +3333,8 @@ class ActionCVCOpenNextPage: ActionSingleUseBase
     {
         EntityAI container = EntityAI.Cast(target.GetObject());
         if (!GetGame().IsServer())
-            return !item && CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.HasNextPage(container);
-        return !item && CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.HasNextPage(container);
+            return CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.HasNextPage(container);
+        return CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.HasNextPage(container);
     }
     override void OnExecuteServer(ActionData action_data)
     {
@@ -3309,7 +3342,7 @@ class ActionCVCOpenNextPage: ActionSingleUseBase
     }
 }
 
-class ActionCVCRetrySave: ActionSingleUseBase
+class ActionCVCRetrySave: ActionInteractBase
 {
     void ActionCVCRetrySave() { m_Text = "Retry virtual cargo save"; }
     override void CreateConditionComponents()
@@ -3321,8 +3354,8 @@ class ActionCVCRetrySave: ActionSingleUseBase
     {
         EntityAI container = EntityAI.Cast(target.GetObject());
         if (!GetGame().IsServer())
-            return !item && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.NeedsRetry(container);
-        return !item && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.NeedsRetry(container);
+            return CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.NeedsRetry(container);
+        return CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.NeedsRetry(container);
     }
     override void OnExecuteServer(ActionData action_data)
     {
@@ -3336,12 +3369,14 @@ modded class ItemBase
     protected string m_CVCLiveItemID;
     protected int m_CVCActionState;
     protected bool m_CVCManagedShell;
+    protected bool m_CVCMovementLocked;
     protected bool m_CVCPreviousAllowDamage;
 
     void ItemBase()
     {
         RegisterNetSyncVariableInt("m_CVCActionState", CVCContainerService.ACTION_NONE, CVCContainerService.ACTION_RETRY);
         RegisterNetSyncVariableBool("m_CVCManagedShell");
+        RegisterNetSyncVariableBool("m_CVCMovementLocked");
     }
 
     string CVCGetVirtualItemID() { return m_CVCVirtualItemID; }
@@ -3366,6 +3401,14 @@ modded class ItemBase
     }
     int CVCGetActionState() { return m_CVCActionState; }
     bool CVCIsManagedShell() { return m_CVCManagedShell; }
+    bool CVCIsMovementLocked() { return m_CVCMovementLocked; }
+    void CVCSetMovementLocked(bool locked)
+    {
+        if (!GetGame().IsServer() || m_CVCMovementLocked == locked)
+            return;
+        m_CVCMovementLocked = locked;
+        SetSynchDirty();
+    }
     void CVCSetManagedShell(bool managed)
     {
         if (!GetGame().IsServer())
@@ -3417,6 +3460,13 @@ modded class ItemBase
     override void SetActions()
     {
         super.SetActions();
+
+        // Only cargo-capable ItemBase objects can ever be managed by Clippy.
+        // Do not add Clippy actions to medicine, food, tools, or other ordinary
+        // held items because that can interfere with their vanilla target actions.
+        if (!CVCContainerPolicy.HasCargo(this))
+            return;
+
         AddAction(ActionCVCOpenNativeCargo);
         AddAction(ActionCVCOpenNextPage);
         AddAction(ActionCVCRetrySave);
@@ -3438,9 +3488,16 @@ modded class ItemBase
 
     override bool CanPutIntoHands(EntityAI parent)
     {
-        if (m_CVCManagedShell)
+        if (m_CVCMovementLocked)
             return false;
         return super.CanPutIntoHands(parent);
+    }
+
+    override bool CanPutAsAttachment(EntityAI parent)
+    {
+        if (m_CVCMovementLocked)
+            return false;
+        return super.CanPutAsAttachment(parent);
     }
 
     override bool CanReleaseCargo(EntityAI cargo)
@@ -3473,6 +3530,8 @@ modded class ItemBase
             CVCContainerService.Unregister(this);
             CVCMigrationService.UnregisterCandidate(this);
             CVCSetManagedShell(false);
+            CVCSetMovementLocked(false);
+            CVCSetActionState(CVCContainerService.ACTION_NONE);
             return;
         }
         CVCContainerService.Register(this);

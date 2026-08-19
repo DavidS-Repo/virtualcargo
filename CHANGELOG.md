@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.3
+
+- Fixed portable cargo containers losing their normal pickup-to-hands action while Clippy marked them as managed shells.
+- Idle clothing, backpacks, bags, barrels, and other ItemBase cargo containers now use normal DayZ `CanPutIntoHands` rules instead of being blocked just because Clippy manages their virtual cargo.
+- Added a separate synced movement lock. Pickup remains blocked while the container is opening, saving, recovering, or migrating, then unlocks again when the container returns to a safe idle state.
+- Fixed Clippy virtual-cargo actions sharing `DefaultActionInput` with vanilla single-use held-item actions. The Clippy actions now derive from `ActionInteractBase`, keeping them in `InteractActionInput`.
+- Limited Clippy ItemBase action injection to cargo-capable items. Medicine, food, tools, and other non-cargo items no longer receive Clippy virtual-cargo actions.
+- This restores the normal DayZ target-player action path for items such as vitamins and pills while keeping self-use unchanged.
+- Kept the 1.0.2 native open/lock checks and post-materialization receive/release safety probe.
+- ClippyAdminHost remains 1.0.1, ClippyStorageHost remains 1.0.0, PostgreSQL schema remains 11, and ClippyServerManager remains revision 21.
+
 ## 1.0.2
 
 - Fixed item-based virtual cargo containers that could materialize and display stored items while native container rules still blocked dragging items out or putting items back.

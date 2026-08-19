@@ -7,4 +7,4 @@ tooltip = "Clippy's Virtual Cargo";
 overview = "Moves selected container cargo into a local PostgreSQL database while the container is closed.";
 action = "https://steamcommunity.com/sharedfiles/filedetails/?id=3782296362";
 author = "Clippy-1";
-version = "1.0.2";
+version = "1.0.3";

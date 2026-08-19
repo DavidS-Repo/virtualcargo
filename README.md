@@ -2,23 +2,23 @@
 
 Clippy Virtual Cargo stores selected DayZ container contents in a private local PostgreSQL database while virtual cargo is closed. Items return to DayZ when a player opens the container and are committed back through Clippy's revision, session, migration, cleanup, and locking workflow.
 
-Version 1.0.2 is a DayZ-side container compatibility fix. It prevents virtual cargo from opening into a visible but non-interactive state on item-based containers whose native open, lock, ownership, or cargo rules reject item movement. ClippyAdminHost remains at 1.0.1, ClippyStorageHost remains at 1.0.0, and PostgreSQL schema 11 is unchanged.
+Version 1.0.3 is a DayZ-side portable-container pickup and action-targeting fix. Idle clothing, backpacks, bags, barrels, and other item-based cargo containers can use normal DayZ pickup-to-hands behavior again. Clippy container actions now use the interaction input group and are only attached to cargo-capable items, so medicine and other ordinary held items keep their normal target-player actions. Clippy still locks movement while virtual cargo is opening, saving, recovering, or migrating. ClippyAdminHost remains at 1.0.1, ClippyStorageHost remains at 1.0.0, and PostgreSQL schema 11 is unchanged.
 
 ## Version split
 
-- Clippy Virtual Cargo release: 1.0.2
+- Clippy Virtual Cargo release: 1.0.3
 - ClippyAdminHost: 1.0.1
 - ClippyStorageHost: 1.0.0
-- Signed DayZ Workshop payload: 1.0.2
+- Signed DayZ Workshop payload: 1.0.3
 - PostgreSQL schema: 11
 - ClippyServerManager revision: 21
 
-This split is intentional. Version 1.0.2 changes the DayZ mod source and requires the new signed 1.0.2 PBO. The native hosts and database schema do not change.
+This split is intentional. Version 1.0.3 changes the DayZ mod source and requires the new signed 1.0.3 PBO. The native hosts and database schema do not change.
 
 ## Install or upgrade
 
 1. Stop the DayZ server before replacing server-side Clippy files.
-2. Download the 1.0.2 Server Ready or GitHub Ready package.
+2. Download the 1.0.3 Server Ready or GitHub Ready package.
 3. Extract it into the folder that contains `DayZServer_x64.exe` and allow the Clippy server-side files to be replaced.
 4. Keep your existing `ClippyServerManager.json`. The manager preserves it and adds missing settings with defaults.
 5. Run `START-CLIPPY-SERVER.bat`.
@@ -27,6 +27,10 @@ This split is intentional. Version 1.0.2 changes the DayZ mod source and require
 For a new installation, review `ClippyServerManager.example.json` if you need custom launch, virtual-cargo, Admin Panel, telemetry, retention, or live-control settings.
 
 PostgreSQL stays on `127.0.0.1:27816` by default. ClippyStorageHost stays on `127.0.0.1:27815`. ClippyAdminHost stays on `127.0.0.1:27817`.
+
+## Portable container pickup in 1.0.3
+
+Clippy now separates a container being managed from a container being unsafe to move. Idle portable storage can be picked up normally when DayZ allows it. A separate movement lock is used only while Clippy has an active open, save, recovery, or migration workflow for that container.
 
 ## Container interaction compatibility in 1.0.2
 
@@ -173,7 +177,7 @@ The Admin Panel accepts loopback requests only. It uses a one-use bootstrap toke
 
 PostgreSQL is not exposed to players or the public network by Clippy. The browser does not receive PostgreSQL credentials, ClippyStorageHost service secrets, or DayZ signing material.
 
-The private `.biprivatekey` is never included in GitHub Ready, Workshop Upload, or Server Ready packages. The 1.0.2 Workshop payload is signed with the existing `ClippyVirtualCargo_0_1` identity.
+The private `.biprivatekey` is never included in GitHub Ready, Workshop Upload, or Server Ready packages. The 1.0.3 Workshop payload is signed with the existing `ClippyVirtualCargo_0_1` identity.
 
 ## Source and packages
 

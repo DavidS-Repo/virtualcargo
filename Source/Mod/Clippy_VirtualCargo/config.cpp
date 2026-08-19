@@ -16,7 +16,7 @@ class CfgMods
         dir = "Clippy_VirtualCargo";
         name = "Clippy's Virtual Cargo";
         author = "Clippy-1";
-        version = "1.0.2";
+        version = "1.0.3";
         type = "mod";
         dependencies[] = {"Game", "World", "Mission"};
 
