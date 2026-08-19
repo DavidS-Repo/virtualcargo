@@ -423,13 +423,6 @@ json AdminDatabase::search_items(const std::string& raw_query,
     } else if (query_text.rfind("item:", 0) == 0) {
         query_text.erase(0, 5);
     }
-    const bool has_filters = min_quantity > 0.0 || max_quantity < 1.0e15 ||
-                             min_health > 0.0 || max_health < 1.0e15 ||
-                             !adapter_filter.empty() || !location_filter.empty();
-    if (query_text.empty() && !has_filters) {
-        return json{{"rows", json::array()}, {"nested_class_search_available", item_index_complete(pool_.get())}};
-    }
-
     const bool index_ready = item_index_complete(pool_.get());
     json rows = json::array();
     std::string next_class;

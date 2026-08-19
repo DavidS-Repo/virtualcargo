@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.1
+
+- Added clickable sortable table headers across the Admin Panel. Numeric, date/time, text, and DayZ position columns use column-appropriate ordering, with ascending/descending state shown in the header. Sorting applies to the currently loaded page.
+- Standardized page search behavior. Container, item, activity, audit, and player filters now run when Search is clicked or Enter is pressed instead of mixing immediate and submit-based searches.
+- Fixed Items search stealing focus after the first typed character. Opening Items with a blank query now browses the first bounded page of indexed virtual cargo instead of showing an empty result until a query is entered.
+- Added Search and Clear controls consistently to filterable pages and added a Containers `Has virtual cargo` shortcut for hiding discovered containers with zero stored nodes.
+- Clarified the global Ctrl+K search box and its `item:`, `container:`, `storage:`, `id:`, and `player:` prefixes.
+- Added editable server-owner settings to the local Settings page. Safe allowlisted Admin Panel, PostgreSQL pool/timeout, telemetry, retention, and live-control settings can be written back to `ClippyServerManager.json`.
+- Settings writes require the authenticated local session and CSRF token, keep a safety copy, use an expected-file fingerprint to reject concurrent config changes, and atomically replace the JSON. Secrets, executable paths, PostgreSQL installation settings, and unrestricted JSON are not exposed.
+- Added unsaved-change detection, Reset and Apply controls, settings validation, reload-after-save behavior, and clear notices for settings that require reopening AdminHost or restarting DayZ.
+- Fixed stale schema-version text in the server manager and expanded the public example configuration to show the Admin Panel limits that are editable in the web UI.
+- Bumped ClippyServerManager to revision 21. Maintainer build-kit revision 27 refreshes the public README and release documentation without changing runtime binaries.
+- Kept ClippyStorageHost, PostgreSQL schema 11, and the signed Workshop payload at 1.0.0 because this patch changes only AdminHost/AdminWeb and server-manager behavior.
+
 ## 1.0.0
 
 - Completed the Admin Panel plan through the DayZ-side container metadata, player telemetry, and live command-bridge phases.

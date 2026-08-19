@@ -9,7 +9,6 @@
     containerId: '',
     currentContainer: null,
     health: null,
-    searchTimer: null,
     searchAbort: null,
     activityTimer: null,
     paletteOpen: false,
@@ -103,7 +102,7 @@
       </aside>
       <section class="workspace">
         <header class="topbar">
-          <div class="global-search"><input id="globalSearch" aria-label="Search or open command palette" placeholder="Search anything..." autocomplete="off"><span class="keyhint">Ctrl K</span></div>
+          <div class="global-search"><input id="globalSearch" aria-label="Search or open command palette" placeholder="Jump to a page or search with item:, container:, storage:, id:..." autocomplete="off"><span class="keyhint">Ctrl K</span></div>
           <div class="statuses" id="statuses"></div>
         </header>
         <main class="content" id="content"></main>
@@ -120,9 +119,82 @@
     return `<div class="page-head"><div><h1>${esc(title)}</h1><div class="subtitle">${esc(subtitle)}</div></div><div class="page-actions">${actions}${badge}</div></div>`;
   }
 
+  function sortTypeForHeader(label) {
+    const key=label.trim().toLowerCase();
+    if(!key || key==='select' || key==='action' || key==='actions') return '';
+    if(key==='position') return 'position';
+    if(/(^|\s)(time|created|updated|expires|captured)(\s|$)/.test(key) || key.includes('last seen') || key.includes('first seen') || key==='snapshot') return 'time';
+    if(['roots','nodes','revision','depth','qty','health','items','aliases','before','after','change','expected rev','cleanup','estimated rows','total','table bytes','indexes','network','latest inventory','size'].includes(key)) return 'number';
+    return 'text';
+  }
+
+  function numericSortValue(text) {
+    const cleaned=String(text||'').replaceAll(',','').trim();
+    const unit=cleaned.match(/(-?\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)\b/i);
+    if(unit){const scales={B:1,KB:1024,MB:1024**2,GB:1024**3,TB:1024**4};return Number(unit[1])*scales[unit[2].toUpperCase()];}
+    const values=[...cleaned.matchAll(/-?\d+(?:\.\d+)?/g)].map(m=>Number(m[0]));
+    return values.length ? values[values.length-1] : Number.NEGATIVE_INFINITY;
+  }
+
+  function sortValue(cell,type) {
+    const explicit=cell?.dataset?.sortValue;
+    if(explicit!==undefined) {
+      if(type==='number'||type==='time'){const value=Number(explicit);return Number.isFinite(value)?value:Number.NEGATIVE_INFINITY;}
+      if(type==='position'){const values=String(explicit).split(',').map(Number);return [values[0]??Number.POSITIVE_INFINITY,values[2]??Number.POSITIVE_INFINITY,values[1]??Number.POSITIVE_INFINITY];}
+      return String(explicit).toLocaleLowerCase();
+    }
+    const text=(cell?.innerText||cell?.textContent||'').trim();
+    if(type==='number') return numericSortValue(text);
+    if(type==='time') { const parsed=Date.parse(text); return Number.isFinite(parsed)?parsed:Number.NEGATIVE_INFINITY; }
+    if(type==='position') {
+      const values=[...text.replaceAll(',','').matchAll(/-?\d+(?:\.\d+)?/g)].map(m=>Number(m[0]));
+      return values.length ? [values[0]??0,values[2]??0,values[1]??0] : [Number.POSITIVE_INFINITY,Number.POSITIVE_INFINITY,Number.POSITIVE_INFINITY];
+    }
+    return text.toLocaleLowerCase();
+  }
+
+  function compareSortValues(left,right,type) {
+    if(type==='position') {
+      for(let i=0;i<3;i++){if(left[i]!==right[i])return left[i]<right[i]?-1:1;}
+      return 0;
+    }
+    if(type==='number'||type==='time') return left===right?0:(left<right?-1:1);
+    return String(left).localeCompare(String(right),undefined,{numeric:true,sensitivity:'base'});
+  }
+
+  function enhanceTables(scope=document) {
+    scope.querySelectorAll('table').forEach(table=>{
+      if(table.dataset.sortEnhanced==='1')return;
+      const headRow=table.tHead?.rows?.[0];const body=table.tBodies?.[0];
+      if(!headRow||!body)return;
+      table.dataset.sortEnhanced='1';
+      [...headRow.cells].forEach((th,index)=>{
+        const label=th.textContent.trim();const type=sortTypeForHeader(label);
+        if(!type)return;
+        const control=document.createElement('button');
+        control.type='button';control.className='table-sort-button';control.textContent=label;
+        control.title=type==='position'?'Sort loaded rows by X, then Z, then Y':'Sort loaded rows';
+        control.setAttribute('aria-label',`Sort by ${label}`);
+        th.replaceChildren(control);th.dataset.sortType=type;th.setAttribute('aria-sort','none');
+        control.addEventListener('click',()=>{
+          const ascending=th.getAttribute('aria-sort')!=='ascending';
+          [...headRow.cells].forEach(other=>other.setAttribute('aria-sort','none'));
+          th.setAttribute('aria-sort',ascending?'ascending':'descending');
+          const rows=[...body.rows].map((row,position)=>({row,position,value:sortValue(row.cells[index],type)}));
+          rows.sort((a,b)=>{const compared=compareSortValues(a.value,b.value,type);return (ascending?compared:-compared)||(a.position-b.position);});
+          rows.forEach(entry=>body.appendChild(entry.row));
+        });
+      });
+    });
+  }
+
   function setContent(html) {
     const content = document.getElementById('content');
-    if (content) content.innerHTML = html;
+    if (content) { content.innerHTML = html; enhanceTables(content); }
+  }
+
+  function bindEnterSearch(ids, run) {
+    ids.forEach(id=>{const el=document.getElementById(id);if(!el)return;el.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();run();}});});
   }
 
   function showError(error) {
@@ -241,15 +313,18 @@
         <label class="field"><span>Status</span><select id="containerStatus"><option value="">All</option><option value="session" ${filters.status==='session'?'selected':''}>Active session</option><option value="recovery" ${filters.status==='recovery'?'selected':''}>Pending recovery</option><option value="locked" ${filters.status==='locked'?'selected':''}>Admin locked</option><option value="idle" ${filters.status==='idle'?'selected':''}>Idle</option></select></label>
         <label class="field"><span>Minimum nodes</span><input id="containerMinNodes" type="number" min="0" max="1000000000" step="1" value="${esc(filters.min_nodes||'')}"></label>
         <label class="field"><span>Not seen for days</span><input id="containerStaleDays" type="number" min="0" max="36500" step="1" value="${esc(filters.stale_days||'')}" placeholder="30"></label>
-        <button class="button primary search-submit" id="containerSearchButton">Apply</button>
-      </div><div class="muted">Search also matches the DayZ-reported container class and map. Item-class filtering uses cargo_item_index after its backfill completes.</div></div></section>
+        <div class="search-actions"><button class="button primary search-submit" id="containerSearchButton">Search</button><button class="button search-submit" id="containerHasCargoButton">Has virtual cargo</button><button class="button search-submit" id="containerClearButton">Clear</button></div>
+      </div><div class="muted">Search also matches the DayZ-reported container class and map. Item-class filtering uses cargo_item_index after its backfill completes. Click a table header to sort the rows loaded on this page.</div></div></section>
       <section class="panel"><div class="table-wrap"><table><thead><tr><th>Container</th><th>Class / Map</th><th>Position</th><th>Roots</th><th>Nodes</th><th>Revision</th><th>Last seen</th><th>Status</th></tr></thead><tbody>
       ${data.rows.map(r => `<tr><td><button class="link-button open-container" data-id="${esc(r.storage_id)}">${esc(r.display_name)}</button><div class="mono muted">${esc(r.storage_id)}</div></td><td>${esc(r.container_class||'Unknown')}<div class="muted">${esc(r.map_name||'Unknown map')}</div></td><td class="mono">${r.world_position_x===undefined?'Unknown':`${fmtNum(r.world_position_x)}, ${fmtNum(r.world_position_y)}, ${fmtNum(r.world_position_z)}`}</td><td>${fmtInt(r.root_count)}</td><td>${fmtInt(r.node_count)}</td><td>${fmtInt(r.revision)}</td><td>${esc(fmtTime(r.last_seen_ms||r.updated_ms))}</td><td>${r.active_session?chip('session','warn'):''}${r.active_operation?chip('operation','warn'):''}${r.active_migration?chip('migration','warn'):''}${r.admin_locked?chip('admin lock','edit'):''}${(!r.active_session&&!r.active_operation&&!r.active_migration&&!r.admin_locked)?chip('idle','good'):''}</td></tr>`).join('')}
       </tbody></table></div>${data.rows.length?'':'<div class="empty">No containers matched.</div>'}</section>
       <div class="pager"><button class="button" id="containerNext" ${data.next_after?'':'disabled'}>Next page</button></div>`);
     const current=()=>({q:document.getElementById('containerSearch').value.trim(),contains:document.getElementById('containerContains').value.trim(),status:document.getElementById('containerStatus').value,min_nodes:document.getElementById('containerMinNodes').value.trim(),stale_days:document.getElementById('containerStaleDays').value.trim()});
-    document.getElementById('containerSearchButton').onclick = () => renderContainers(current(), '').catch(showError);
-    for(const id of ['containerSearch','containerContains','containerMinNodes','containerStaleDays'])document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') renderContainers(current(), '').catch(showError); });
+    const runSearch=()=>renderContainers(current(), '').catch(showError);
+    document.getElementById('containerSearchButton').onclick = runSearch;
+    document.getElementById('containerHasCargoButton').onclick = () => renderContainers({...current(),min_nodes:'1'}, '').catch(showError);
+    document.getElementById('containerClearButton').onclick = () => renderContainers({}, '').catch(showError);
+    bindEnterSearch(['containerSearch','containerContains','containerMinNodes','containerStaleDays'],runSearch);
     document.querySelectorAll('.open-container').forEach(b => b.onclick = () => navigate('container',{containerId:b.dataset.id}));
     document.getElementById('containerNext').onclick = () => renderContainers(filters, data.next_after || '').catch(showError);
   }
@@ -393,6 +468,7 @@
     dialog.className='modal';dialog.setAttribute('aria-labelledby',titleId);
     dialog.innerHTML=`<form class="modal-card"><div class="modal-head"><h2 id="${titleId}">${esc(title)}</h2><button type="button" class="icon-button close-dialog" aria-label="Close">×</button></div><div class="modal-body">${body}</div><div class="modal-actions"><button type="button" class="button cancel-dialog">Cancel</button><button type="submit" class="button ${danger?'danger':'primary'}">${esc(confirm)}</button></div></form>`;
     document.body.appendChild(dialog);
+    enhanceTables(dialog);
     const close=()=>{if(dialog.open)dialog.close();dialog.remove();if(previousFocus&&previousFocus.isConnected&&typeof previousFocus.focus==='function')previousFocus.focus();};
     dialog.querySelector('.close-dialog').onclick=close; dialog.querySelector('.cancel-dialog').onclick=close;
     dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
@@ -542,23 +618,23 @@
     const selectedCount=state.itemSelections.size;
     setContent(`${pageHead('Items','Search virtual cargo without materializing it into DayZ.',`<button class="button" id="exportItemPage">Export page</button>`)}
       <section class="panel"><div class="panel-body"><div class="search-grid">
-        <label class="field wide"><span>Class prefix or exact item ID</span><input id="itemQuery" value="${esc(q)}" placeholder="M4A1, id:exact-item-id, or leave blank for filters"></label>
+        <label class="field wide"><span>Class prefix or exact item ID</span><input id="itemQuery" value="${esc(q)}" placeholder="M4A1, id:exact-item-id, or leave blank to browse"></label>
         <label class="field"><span>Adapter ID</span><input id="adapterId" maxlength="128" value="${esc(cursor.adapter_id||'')}" placeholder="exact adapter"></label>
         <label class="field"><span>Location</span><input id="locationType" maxlength="64" value="${esc(cursor.location_type||'')}" placeholder="cargo / attachment"></label>
         <label class="field"><span>Min qty</span><input id="minQty" type="number" min="0" step="any" value="${esc(cursor.min_quantity||'')}"></label>
         <label class="field"><span>Max qty</span><input id="maxQty" type="number" min="0" step="any" value="${esc(cursor.max_quantity||'')}"></label>
         <label class="field"><span>Min health</span><input id="minHealth" type="number" min="0" step="any" value="${esc(cursor.min_health||'')}"></label>
         <label class="field"><span>Max health</span><input id="maxHealth" type="number" min="0" step="any" value="${esc(cursor.max_health||'')}"></label>
-        <button class="button primary search-submit" id="itemSearchButton">Search</button>
-      </div><div class="muted">${data.nested_class_search_available?'Nested class search is using cargo_item_index.':'Index backfill is incomplete. Search is limited to root class prefixes and exact item IDs.'}${data.filter_requires_index?' Adapter and location filters require the completed item index.':''}</div></div></section>
+        <div class="search-actions"><button class="button primary search-submit" id="itemSearchButton">Search</button><button class="button search-submit" id="itemClearButton">Clear</button></div>
+      </div><div class="muted">${data.nested_class_search_available?'Nested class search is using cargo_item_index.':'Index backfill is incomplete. Search is limited to root class prefixes and exact item IDs.'}${data.filter_requires_index?' Adapter and location filters require the completed item index.':''} Click a table header to sort the rows loaded on this page.</div></div></section>
       ${state.editingEnabled?`<section class="panel bulk-bar"><div class="panel-body"><strong id="bulkCount">${selectedCount} root${selectedCount===1?'':'s'} selected</strong> <span class="muted">Bulk changes are limited to 25 roots and always run a conflict preview first. Move/copy requires all selected roots to come from one source container.</span><div class="page-actions"><button class="button" id="bulkExport" ${selectedCount?'':'disabled'}>Export selected</button> <button class="button" id="bulkMove" ${selectedCount?'':'disabled'}>Preview move</button> <button class="button" id="bulkCopy" ${selectedCount?'':'disabled'}>Preview copy</button> <button class="button" id="bulkQuarantine" ${selectedCount?'':'disabled'}>Preview quarantine</button> <button class="button danger" id="bulkRemove" ${selectedCount?'':'disabled'}>Preview remove</button> <button class="button" id="bulkClear" ${selectedCount?'':'disabled'}>Clear</button></div></div></section>`:''}
       <section class="panel"><div class="table-wrap"><table><thead><tr>${state.editingEnabled?'<th>Select</th>':''}<th>Class</th><th>Container</th><th>Item ID</th><th>Parent</th><th>Depth</th><th>Qty</th><th>Health</th><th>Adapter</th><th>Location</th><th>Updated</th><th></th></tr></thead><tbody>${data.rows.map(r=>{const key=`${r.storage_id}|${r.root_item_id}`;const root=r.item_id===r.root_item_id;const rowData=esc(encodeURIComponent(JSON.stringify(r)));return `<tr>${state.editingEnabled?`<td>${root?`<input type="checkbox" class="bulk-select" data-row="${rowData}" ${state.itemSelections.has(key)?'checked':''} aria-label="Select ${esc(r.class_name)} for bulk action">`:'<span class="muted">nested</span>'}</td>`:''}<td>${esc(r.class_name)}</td><td><button class="link-button open-container" data-id="${esc(r.storage_id)}">${esc(r.storage_id)}</button></td><td class="mono">${esc(r.item_id)}</td><td class="mono">${esc(r.parent_item_id||'')}</td><td>${fmtInt(r.depth)}</td><td>${fmtNum(r.quantity)}</td><td>${fmtNum(r.health)}</td><td class="mono">${esc(r.adapter_id||'')}</td><td>${esc(r.location_type||'')}</td><td>${esc(fmtTime(r.updated_ms))}</td><td><button class="mini-button open-item-tree" data-row="${rowData}">Open tree</button> <button class="mini-button item-history" data-id="${esc(r.item_id)}">History</button> <button class="mini-button export-search-row" data-row="${rowData}">Export</button>${state.editingEnabled?` <button class="mini-button item-search-edit" data-row="${rowData}">Edit</button> <button class="mini-button warn item-search-quarantine" data-row="${rowData}">Quarantine</button>`:''}</td></tr>`;}).join('')}</tbody></table></div>${data.rows.length?'':'<div class="empty">No items matched.</div>'}</section>
       <div class="pager"><button class="button" id="itemsNext" ${data.next_after_storage?'':'disabled'}>Next page</button></div>`);
     const currentFilters=()=>{const filters={};for(const [id,key] of [['minQty','min_quantity'],['maxQty','max_quantity'],['minHealth','min_health'],['maxHealth','max_health'],['adapterId','adapter_id'],['locationType','location_type']]){const v=document.getElementById(id).value.trim();if(v)filters[key]=v;}return filters;};
     const run=()=>{state.itemSelections.clear();renderItems(document.getElementById('itemQuery').value.trim(),currentFilters()).catch(showError);};
     document.getElementById('itemSearchButton').onclick=run;
-    document.getElementById('itemQuery').addEventListener('input',()=>{clearTimeout(state.searchTimer);state.searchTimer=setTimeout(run,200);});
-    document.getElementById('itemQuery').addEventListener('keydown',e=>{if(e.key==='Enter')run();});
+    document.getElementById('itemClearButton').onclick=()=>{state.itemSelections.clear();renderItems('',{}).catch(showError);};
+    bindEnterSearch(['itemQuery','adapterId','locationType','minQty','maxQty','minHealth','maxHealth'],run);
     document.querySelectorAll('.open-container').forEach(b=>b.onclick=()=>navigate('container',{containerId:b.dataset.id}));
     document.querySelectorAll('.open-item-tree').forEach(b=>b.onclick=()=>{const r=JSON.parse(decodeURIComponent(b.dataset.row));state.pendingRootId=r.root_item_id;navigate('container',{containerId:r.storage_id});});
     document.querySelectorAll('.item-history').forEach(b=>b.onclick=()=>viewItemHistory(b.dataset.id));
@@ -623,9 +699,12 @@
   async function renderActivity(filters={}) {
     const params=()=>{const p=new URLSearchParams({limit:'75'});for(const key of ['target','event','source','from_ms','to_ms'])if(filters[key])p.set(key,filters[key]);return p;};
     setContent(`${pageHead('Activity','Recent storage and successful admin events. This bounded view refreshes every five seconds.')}
-      <section class="panel"><div class="panel-body"><div class="search-grid"><label class="field"><span>Target</span><input id="activityTarget" maxlength="128" value="${esc(filters.target||'')}" placeholder="container, operation, item"></label><label class="field"><span>Event type</span><input id="activityEvent" maxlength="128" value="${esc(filters.event||'')}" placeholder="event type"></label><label class="field"><span>Source</span><select id="activitySource"><option value="">All</option><option value="storage" ${filters.source==='storage'?'selected':''}>Storage</option><option value="admin" ${filters.source==='admin'?'selected':''}>Admin</option></select></label><label class="field"><span>From</span><input id="activityFrom" type="datetime-local" value="${esc(fmtLocalInput(filters.from_ms))}"></label><label class="field"><span>To</span><input id="activityTo" type="datetime-local" value="${esc(fmtLocalInput(filters.to_ms))}"></label><button class="button primary search-submit" id="activityApply">Apply</button></div></div></section><div id="activityHost"></div>`);
-    const load=async()=>{const data=await api(`/api/activity?${params()}`);if(state.route!=='activity')return;const host=document.getElementById('activityHost');if(host)host.innerHTML=activityTable(data.rows||[]);};
-    document.getElementById('activityApply').onclick=()=>{const from=localInputMs(document.getElementById('activityFrom').value);const to=localInputMs(document.getElementById('activityTo').value);if(from&&to&&from>to){toast('Activity From must be before To.','warn');return;}renderActivity({target:document.getElementById('activityTarget').value.trim(),event:document.getElementById('activityEvent').value.trim(),source:document.getElementById('activitySource').value,from_ms:from,to_ms:to}).catch(showError);};
+      <section class="panel"><div class="panel-body"><div class="search-grid"><label class="field"><span>Target</span><input id="activityTarget" maxlength="128" value="${esc(filters.target||'')}" placeholder="container, operation, item"></label><label class="field"><span>Event type</span><input id="activityEvent" maxlength="128" value="${esc(filters.event||'')}" placeholder="event type"></label><label class="field"><span>Source</span><select id="activitySource"><option value="">All</option><option value="storage" ${filters.source==='storage'?'selected':''}>Storage</option><option value="admin" ${filters.source==='admin'?'selected':''}>Admin</option></select></label><label class="field"><span>From</span><input id="activityFrom" type="datetime-local" value="${esc(fmtLocalInput(filters.from_ms))}"></label><label class="field"><span>To</span><input id="activityTo" type="datetime-local" value="${esc(fmtLocalInput(filters.to_ms))}"></label><div class="search-actions"><button class="button primary search-submit" id="activityApply">Search</button><button class="button search-submit" id="activityClear">Clear</button></div></div></div></section><div id="activityHost"></div>`);
+    const load=async()=>{const data=await api(`/api/activity?${params()}`);if(state.route!=='activity')return;const host=document.getElementById('activityHost');if(host){host.innerHTML=activityTable(data.rows||[]);enhanceTables(host);}};
+    const runSearch=()=>{const from=localInputMs(document.getElementById('activityFrom').value);const to=localInputMs(document.getElementById('activityTo').value);if(from&&to&&from>to){toast('Activity From must be before To.','warn');return;}renderActivity({target:document.getElementById('activityTarget').value.trim(),event:document.getElementById('activityEvent').value.trim(),source:document.getElementById('activitySource').value,from_ms:from,to_ms:to}).catch(showError);};
+    document.getElementById('activityApply').onclick=runSearch;
+    document.getElementById('activityClear').onclick=()=>renderActivity({}).catch(showError);
+    bindEnterSearch(['activityTarget','activityEvent','activityFrom','activityTo'],runSearch);
     await load();
     state.activityTimer=setInterval(()=>load().catch(()=>{}),5000);
   }
@@ -754,11 +833,14 @@
     for(const key of ['before_ms','before_id','from_ms','to_ms','admin','action','target_type','target_id','result'])if(stateFilter[key])params.set(key,stateFilter[key]);
     const [audit,changes]=await Promise.all([api(`/api/audit?${params}`),api('/api/admin/changes?limit=30')]);
     setContent(`${pageHead('Audit Log','Durable admin action results and revision-safe change history.',`<button class="button" id="exportAudit">Export page</button>`)}
-      <section class="panel"><div class="panel-body"><div class="search-grid"><label class="field"><span>Admin</span><input id="auditAdmin" maxlength="128" value="${esc(stateFilter.admin||'')}"></label><label class="field"><span>Action</span><input id="auditAction" maxlength="128" value="${esc(stateFilter.action||'')}"></label><label class="field"><span>Target type</span><input id="auditTargetType" maxlength="64" value="${esc(stateFilter.target_type||'')}"></label><label class="field"><span>Target ID</span><input id="auditTargetId" maxlength="128" value="${esc(stateFilter.target_id||'')}"></label><label class="field"><span>Result</span><select id="auditResult"><option value="">All</option><option value="SUCCESS" ${stateFilter.result==='SUCCESS'?'selected':''}>Success</option><option value="FAILURE" ${stateFilter.result==='FAILURE'?'selected':''}>Failure</option></select></label><label class="field"><span>From</span><input id="auditFrom" type="datetime-local" value="${esc(fmtLocalInput(stateFilter.from_ms))}"></label><label class="field"><span>To</span><input id="auditTo" type="datetime-local" value="${esc(fmtLocalInput(stateFilter.to_ms))}"></label><button class="button primary search-submit" id="auditApply">Apply</button></div></div></section>
+      <section class="panel"><div class="panel-body"><div class="search-grid"><label class="field"><span>Admin</span><input id="auditAdmin" maxlength="128" value="${esc(stateFilter.admin||'')}"></label><label class="field"><span>Action</span><input id="auditAction" maxlength="128" value="${esc(stateFilter.action||'')}"></label><label class="field"><span>Target type</span><input id="auditTargetType" maxlength="64" value="${esc(stateFilter.target_type||'')}"></label><label class="field"><span>Target ID</span><input id="auditTargetId" maxlength="128" value="${esc(stateFilter.target_id||'')}"></label><label class="field"><span>Result</span><select id="auditResult"><option value="">All</option><option value="SUCCESS" ${stateFilter.result==='SUCCESS'?'selected':''}>Success</option><option value="FAILURE" ${stateFilter.result==='FAILURE'?'selected':''}>Failure</option></select></label><label class="field"><span>From</span><input id="auditFrom" type="datetime-local" value="${esc(fmtLocalInput(stateFilter.from_ms))}"></label><label class="field"><span>To</span><input id="auditTo" type="datetime-local" value="${esc(fmtLocalInput(stateFilter.to_ms))}"></label><div class="search-actions"><button class="button primary search-submit" id="auditApply">Search</button><button class="button search-submit" id="auditClear">Clear</button></div></div></div></section>
       <section class="panel"><div class="panel-head"><h2>Recent changes</h2></div>${changesTable(changes.rows)}</section>
       <section class="panel"><div class="panel-head"><h2>Action audit</h2></div>${audit.rows.length?`<div class="table-wrap"><table><thead><tr><th>Time</th><th>Result</th><th>Action</th><th>Target</th><th>Admin</th><th>Reason / error</th><th>Request</th></tr></thead><tbody>${audit.rows.map(r=>`<tr><td>${esc(fmtTime(r.created_ms))}</td><td>${chip(r.result,r.result==='SUCCESS'?'good':'danger')}</td><td>${esc(r.action)}</td><td><span>${esc(r.target_type)}</span><div class="mono muted">${esc(r.target_id)}</div></td><td>${esc(r.windows_identity||'')}</td><td>${esc(r.error||r.reason||'')}</td><td class="mono">${esc(r.request_id||'')}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No admin audit records matched.</div>'}</section><div class="pager"><button class="button" id="auditNext" ${audit.next_before_id?'':'disabled'}>Older audit events</button></div>`);
     wireChangeButtons();
-    document.getElementById('auditApply').onclick=()=>{const from=localInputMs(document.getElementById('auditFrom').value);const to=localInputMs(document.getElementById('auditTo').value);if(from&&to&&from>to){toast('Audit From must be before To.','warn');return;}renderAudit({admin:document.getElementById('auditAdmin').value.trim(),action:document.getElementById('auditAction').value.trim(),target_type:document.getElementById('auditTargetType').value.trim(),target_id:document.getElementById('auditTargetId').value.trim(),result:document.getElementById('auditResult').value,from_ms:from,to_ms:to}).catch(showError);};
+    const runSearch=()=>{const from=localInputMs(document.getElementById('auditFrom').value);const to=localInputMs(document.getElementById('auditTo').value);if(from&&to&&from>to){toast('Audit From must be before To.','warn');return;}renderAudit({admin:document.getElementById('auditAdmin').value.trim(),action:document.getElementById('auditAction').value.trim(),target_type:document.getElementById('auditTargetType').value.trim(),target_id:document.getElementById('auditTargetId').value.trim(),result:document.getElementById('auditResult').value,from_ms:from,to_ms:to}).catch(showError);};
+    document.getElementById('auditApply').onclick=runSearch;
+    document.getElementById('auditClear').onclick=()=>renderAudit({}).catch(showError);
+    bindEnterSearch(['auditAdmin','auditAction','auditTargetType','auditTargetId','auditFrom','auditTo'],runSearch);
     document.getElementById('exportAudit').onclick=()=>downloadJson('clippy-admin-audit-page.json',{filters:stateFilter,rows:audit.rows});
     document.getElementById('auditNext').onclick=()=>renderAudit({...stateFilter,before_ms:audit.next_before_ms,before_id:audit.next_before_id});
   }
@@ -767,7 +849,7 @@
     const data=await api('/api/database/info');
     setContent(`${pageHead('Database','Safe inspection of the private Clippy PostgreSQL database.')}
       <div class="cards">${card('PostgreSQL',data.postgres_version,'127.0.0.1 only')}${card('Database',data.database,fmtBytes(data.size_bytes))}${card('Schema',`v${data.schema_version}`,data.item_index_complete?'Item index ready':'Index backfill pending')}${card('Read role',data.role,data.transaction_read_only?'transaction_read_only=on':'read role check failed')}${card('Connections',fmtInt(data.connections),'Current database backends')}${card('Schemas',(data.schemas||[]).join(', ')||'clippy','Visible to the admin read role')}</div>
-      <section class="panel"><div class="panel-head"><h2>Clippy tables</h2><span class="muted">Select a table for a bounded read-only preview</span></div><div class="table-wrap"><table><thead><tr><th>Table</th><th>Estimated rows</th><th>Total</th><th>Table</th><th>Indexes</th><th></th></tr></thead><tbody>${data.tables.map(r=>`<tr><td class="mono">${esc(r.name)}</td><td>${fmtInt(r.estimated_rows)}</td><td>${fmtBytes(r.total_bytes)}</td><td>${fmtBytes(r.table_bytes)}</td><td>${fmtBytes(r.index_bytes)}</td><td><button class="button browse-db-table" data-table="${esc(r.name)}">Browse</button></td></tr>`).join('')}</tbody></table></div></section>
+      <section class="panel"><div class="panel-head"><h2>Clippy tables</h2><span class="muted">Select a table for a bounded read-only preview</span></div><div class="table-wrap"><table><thead><tr><th>Table</th><th>Estimated rows</th><th>Total</th><th>Table bytes</th><th>Indexes</th><th></th></tr></thead><tbody>${data.tables.map(r=>`<tr><td class="mono">${esc(r.name)}</td><td>${fmtInt(r.estimated_rows)}</td><td>${fmtBytes(r.total_bytes)}</td><td>${fmtBytes(r.table_bytes)}</td><td>${fmtBytes(r.index_bytes)}</td><td><button class="button browse-db-table" data-table="${esc(r.name)}">Browse</button></td></tr>`).join('')}</tbody></table></div></section>
       <section class="panel" id="dbPreview" hidden><div class="panel-head"><h2 id="dbPreviewTitle">Table preview</h2></div><div id="dbPreviewBody"></div></section>
       <div class="notice">There is no writable SQL console. Table names come from a fixed server-side allowlist, values are parameterized, large tree/change fields are omitted from previews, and browser writes use domain endpoints only.</div>`);
     document.querySelectorAll('.browse-db-table').forEach(b=>b.onclick=()=>browseDatabaseTable(b.dataset.table,''));
@@ -778,6 +860,7 @@
       const data=await api(`/api/database/table/${encodeURIComponent(table)}?limit=50&after=${encodeURIComponent(after)}`);
       const panel=document.getElementById('dbPreview');const body=document.getElementById('dbPreviewBody');const title=document.getElementById('dbPreviewTitle');
       panel.hidden=false;title.textContent=`${table} preview`;body.innerHTML=(data.rows||[]).length?`<div class="table-wrap"><table><thead><tr><th>CTID</th><th>Row</th><th></th></tr></thead><tbody>${data.rows.map(r=>`<tr><td class="mono">${esc(r.ctid)}</td><td><code>${esc(JSON.stringify(r.row))}</code></td><td><button class="button inspect-db-row" data-row="${esc(encodeURIComponent(JSON.stringify(r.row)))}">Inspect</button></td></tr>`).join('')}</tbody></table></div><div class="panel-body"><span class="muted">Omitted large fields: ${(data.omitted_large_fields||[]).map(esc).join(', ')}</span> <button class="button" id="dbNext" ${data.next_after?'':'disabled'}>Next page</button></div>`:'<div class="empty">No rows in this table.</div>';
+      enhanceTables(body);
       document.querySelectorAll('.inspect-db-row').forEach(b=>b.onclick=()=>inspectJson(`${table} row`,JSON.parse(decodeURIComponent(b.dataset.row))));
       const next=document.getElementById('dbNext');if(next)next.onclick=()=>browseDatabaseTable(table,data.next_after||'');panel.scrollIntoView({block:'start'});
     } catch(error){toast(error.message,'danger');}
@@ -806,7 +889,7 @@
     const rows=data.rows||[];
     if(!rows.length){host.innerHTML=`<div class="panel-head"><h2>${esc(title)}</h2></div><div class="empty">No rows matched.</div>`;return;}
     const keys=Object.keys(rows[0]);
-    host.innerHTML=`<div class="panel-head"><h2>${esc(title)}</h2><span class="muted">Top ${fmtInt(rows.length)}</span></div><div class="table-wrap"><table><thead><tr>${keys.map(k=>`<th>${esc(k.replaceAll('_',' '))}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${keys.map(k=>`<td>${k.endsWith('_ms')?esc(fmtTime(r[k])):typeof r[k]==='number'?esc(fmtNum(r[k])):esc(r[k]??'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+    host.innerHTML=`<div class="panel-head"><h2>${esc(title)}</h2><span class="muted">Top ${fmtInt(rows.length)}</span></div><div class="table-wrap"><table><thead><tr>${keys.map(k=>`<th>${esc(k.replaceAll('_',' '))}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${keys.map(k=>`<td>${k.endsWith('_ms')?esc(fmtTime(r[k])):typeof r[k]==='number'?esc(fmtNum(r[k])):esc(r[k]??'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;enhanceTables(host);
   }
 
   async function renderPlayers(query='', beforeMs=0, beforeId='') {
@@ -821,12 +904,14 @@
       : '<div class="notice warn">Player telemetry is currently disabled in ClippyServerManager.json. Historical snapshots remain readable, but they may be stale.</div>';
     setContent(`${pageHead('Players','Server-side player registry, inventory snapshots, item search, and optional live controls.')}
       ${banner}
-      <section class="panel"><div class="panel-body"><div class="search-grid"><label class="field wide"><span>Player</span><input id="playerSearch" maxlength="128" placeholder="name or player ID" value="${esc(query)}"></label><button class="button primary search-submit" id="playerSearchButton">Search</button></div></div></section>
-      <section class="panel"><div class="panel-head"><h2>Player registry</h2><span class="muted">Online is based on recent telemetry</span></div><div class="table-wrap"><table><thead><tr><th>Player</th><th>Status</th><th>Latest inventory</th><th>Network</th><th>Map</th><th>Last seen</th><th>Aliases</th><th></th></tr></thead><tbody>${(players.rows||[]).map(r=>`<tr><td><strong>${esc(r.display_name||r.player_id)}</strong><div class="mono muted">${esc(r.player_id)}</div></td><td>${r.online?chip('online','good'):chip('offline')}</td><td>${fmtInt(r.last_inventory_count)} items<div class="muted">${esc(fmtTime(r.last_snapshot_ms))}</div></td><td>${r.last_ping_ms==null?'Unavailable':`${fmtInt(r.last_ping_ms)} ms`}<div class="muted">${r.last_bandwidth_kbps==null?'':`${fmtInt(r.last_bandwidth_kbps)} kbps`}</div></td><td>${esc(r.last_map_name||'')}</td><td>${esc(fmtTime(r.last_seen_ms))}</td><td>${fmtInt(r.alias_count)}</td><td><button class="button open-player" data-player="${esc(r.player_id)}">Open</button></td></tr>`).join('')}</tbody></table></div>${(players.rows||[]).length?'':'<div class="empty">No players matched.</div>'}</section>
+      <section class="panel"><div class="panel-body"><div class="search-grid"><label class="field wide"><span>Player</span><input id="playerSearch" maxlength="128" placeholder="name or player ID" value="${esc(query)}"></label><div class="search-actions"><button class="button primary search-submit" id="playerSearchButton">Search</button><button class="button search-submit" id="playerClearButton">Clear</button></div></div></div></section>
+      <section class="panel"><div class="panel-head"><h2>Player registry</h2><span class="muted">Online is based on recent telemetry</span></div><div class="table-wrap"><table><thead><tr><th>Player</th><th>Status</th><th>Latest inventory</th><th>Network</th><th>Map</th><th>Last seen</th><th>Aliases</th><th></th></tr></thead><tbody>${(players.rows||[]).map(r=>`<tr><td><strong>${esc(r.display_name||r.player_id)}</strong><div class="mono muted">${esc(r.player_id)}</div></td><td>${r.online?chip('online','good'):chip('offline')}</td><td data-sort-value="${Number(r.last_inventory_count)||0}">${fmtInt(r.last_inventory_count)} items<div class="muted">${esc(fmtTime(r.last_snapshot_ms))}</div></td><td data-sort-value="${r.last_ping_ms==null?Number.POSITIVE_INFINITY:Number(r.last_ping_ms)}">${r.last_ping_ms==null?'Unavailable':`${fmtInt(r.last_ping_ms)} ms`}<div class="muted">${r.last_bandwidth_kbps==null?'':`${fmtInt(r.last_bandwidth_kbps)} kbps`}</div></td><td>${esc(r.last_map_name||'')}</td><td>${esc(fmtTime(r.last_seen_ms))}</td><td>${fmtInt(r.alias_count)}</td><td><button class="button open-player" data-player="${esc(r.player_id)}">Open</button></td></tr>`).join('')}</tbody></table></div>${(players.rows||[]).length?'':'<div class="empty">No players matched.</div>'}</section>
       <div class="pager"><button class="button" id="playersNext" ${players.next_before_id?'':'disabled'}>Next page</button></div>
       <section class="panel"><div class="panel-head"><h2>Latest carried items</h2><span class="muted">Searches the latest stored snapshot for each player</span></div><div class="table-wrap"><table><thead><tr><th>Class</th><th>Player</th><th>Item ID</th><th>Depth</th><th>Qty</th><th>Health</th><th>Snapshot</th></tr></thead><tbody>${(items.rows||[]).map(r=>`<tr><td>${esc(r.class_name)}</td><td><button class="link-button open-player" data-player="${esc(r.player_id)}">${esc(r.display_name||r.player_id)}</button></td><td class="mono">${esc(r.item_id)}</td><td>${fmtInt(r.depth)}</td><td>${fmtNum(r.quantity)}</td><td>${fmtNum(r.health)}</td><td>${esc(fmtTime(r.captured_ms))}</td></tr>`).join('')}</tbody></table></div>${(items.rows||[]).length?'':'<div class="empty">No carried items matched this search.</div>'}</section>`);
     const apply=()=>renderPlayers(document.getElementById('playerSearch').value.trim()).catch(showError);
-    document.getElementById('playerSearchButton').onclick=apply;document.getElementById('playerSearch').addEventListener('keydown',e=>{if(e.key==='Enter')apply();});
+    document.getElementById('playerSearchButton').onclick=apply;
+    document.getElementById('playerClearButton').onclick=()=>renderPlayers('').catch(showError);
+    bindEnterSearch(['playerSearch'],apply);
     document.querySelectorAll('.open-player').forEach(b=>b.onclick=()=>renderPlayerDetail(b.dataset.player).catch(showError));
     document.getElementById('playersNext').onclick=()=>renderPlayers(query,players.next_before_ms||0,players.next_before_id||'').catch(showError);
   }
@@ -911,9 +996,127 @@
 
   async function renderSettings() {
     const data=await api('/api/settings');
-    setContent(`${pageHead('Settings','Effective safe AdminHost settings. Secrets are never returned by this API.')}
-      <section class="panel"><div class="panel-head"><h2>Local services</h2></div><div class="panel-body detail-grid">${pair('Admin listener',`${data.listen_address}:${data.port}`)}${pair('Storage Host',`${data.storage_host_address}:${data.storage_host_port}`)}${pair('PostgreSQL',`${data.postgres_host}:${data.postgres_port}`)}${pair('Database',data.postgres_database)}${pair('Read role',data.postgres_read_role)}${pair('Read pool',fmtInt(data.postgres_read_pool_size))}${pair('Idle shutdown',`${fmtInt(data.idle_shutdown_minutes)} minutes`)}${pair('Maintenance lock',`${fmtInt(data.maintenance_lock_seconds)} seconds`)}${pair('Export folder',data.export_directory||'exports')}${pair('Editing',data.editing_enabled?'Enabled':'Disabled')}${pair('Player telemetry',data.player_telemetry_enabled?'Enabled':'Disabled')}${pair('Network telemetry',data.player_network_telemetry_enabled?'Enabled':'Disabled')}${pair('Position telemetry',data.player_position_telemetry_enabled?'Enabled':'Disabled')}${pair('Snapshot interval',`${fmtInt(data.player_snapshot_interval_seconds)} seconds`)}${pair('Telemetry retention',`${fmtInt(data.player_telemetry_retention_days)} days`)}${pair('Snapshot history cap',fmtInt(data.player_snapshot_history_limit))}${pair('Admin audit retention',`${fmtInt(data.admin_audit_retention_days)} days`)}${pair('Player IP collection',data.player_ip_collection_supported?'Supported':'Not exposed by DayZ API')}${pair('Live player control',data.live_player_control_enabled?'Enabled':'Disabled')}${pair('Command expiry',`${fmtInt(data.player_command_expiry_seconds)} seconds`)}</div></section>
-      <div class="notice">Server-specific ClippyServerManager.json remains the source for these settings. The panel does not expose database passwords, StorageHost tokens, or signing material.</div>`);
+    const saved=data.manager_settings||{available:false};
+    const pendingRuntime=Boolean(saved.available&&(
+      Number(saved.port)!==Number(data.port) ||
+      saved.enable_editing!==data.editing_enabled ||
+      Number(saved.idle_shutdown_minutes)!==Number(data.idle_shutdown_minutes) ||
+      Number(saved.http_threads)!==Number(data.http_threads) ||
+      Number(saved.max_queued_requests)!==Number(data.max_queued_requests) ||
+      Number(saved.max_request_bytes)!==Number(data.max_request_bytes) ||
+      Number(saved.postgres_pool_size)!==Number(data.postgres_read_pool_size) ||
+      Number(saved.postgres_connect_timeout_seconds)!==Number(data.postgres_connect_timeout_seconds) ||
+      Number(saved.postgres_statement_timeout_ms)!==Number(data.postgres_statement_timeout_ms) ||
+      Number(saved.postgres_lock_timeout_ms)!==Number(data.postgres_lock_timeout_ms) ||
+      Number(saved.postgres_idle_transaction_timeout_ms)!==Number(data.postgres_idle_transaction_timeout_ms) ||
+      Number(saved.maintenance_lock_seconds)!==Number(data.maintenance_lock_seconds) ||
+      Number(saved.postgres_write_pool_size)!==Number(data.postgres_write_pool_size) ||
+      Number(saved.postgres_write_statement_timeout_ms)!==Number(data.postgres_write_statement_timeout_ms) ||
+      Number(saved.postgres_write_lock_timeout_ms)!==Number(data.postgres_write_lock_timeout_ms) ||
+      saved.enable_player_telemetry!==data.player_telemetry_enabled ||
+      saved.enable_player_network_telemetry!==data.player_network_telemetry_enabled ||
+      saved.enable_player_position_telemetry!==data.player_position_telemetry_enabled ||
+      Number(saved.player_snapshot_interval_seconds)!==Number(data.player_snapshot_interval_seconds) ||
+      Number(saved.player_telemetry_retention_days)!==Number(data.player_telemetry_retention_days) ||
+      Number(saved.player_snapshot_history_limit)!==Number(data.player_snapshot_history_limit) ||
+      Number(saved.admin_audit_retention_days)!==Number(data.admin_audit_retention_days) ||
+      saved.enable_live_player_control!==data.live_player_control_enabled ||
+      Number(saved.player_command_expiry_seconds)!==Number(data.player_command_expiry_seconds)
+    ));
+    const check=(id,label,value,help='')=>`<label class="check-field"><input id="${id}" type="checkbox" ${value?'checked':''}><span><strong>${esc(label)}</strong>${help?`<small>${esc(help)}</small>`:''}</span></label>`;
+    const number=(id,label,value,min,max,help='')=>`<label class="field"><span>${esc(label)}</span><input id="${id}" type="number" min="${min}" max="${max}" step="1" value="${esc(value)}">${help?`<small>${esc(help)}</small>`:''}</label>`;
+    const runtimePairs=`${pair('Admin listener',`${data.listen_address}:${data.port}`)}${pair('Storage Host',`${data.storage_host_address}:${data.storage_host_port}`)}${pair('PostgreSQL',`${data.postgres_host}:${data.postgres_port}`)}${pair('Database',data.postgres_database)}${pair('Read role',data.postgres_read_role)}${pair('Read pool',fmtInt(data.postgres_read_pool_size))}${pair('Idle shutdown',`${fmtInt(data.idle_shutdown_minutes)} minutes`)}${pair('HTTP threads',fmtInt(data.http_threads))}${pair('Queued requests',fmtInt(data.max_queued_requests))}${pair('Request limit',fmtBytes(data.max_request_bytes))}${pair('PG connect timeout',`${fmtInt(data.postgres_connect_timeout_seconds)} seconds`)}${pair('PG statement timeout',`${fmtInt(data.postgres_statement_timeout_ms)} ms`)}${pair('PG lock timeout',`${fmtInt(data.postgres_lock_timeout_ms)} ms`)}${pair('PG idle transaction',`${fmtInt(data.postgres_idle_transaction_timeout_ms)} ms`)}${pair('Maintenance lock',`${fmtInt(data.maintenance_lock_seconds)} seconds`)}${pair('Export folder',data.export_directory||'exports')}${pair('Editing',data.editing_enabled?'Enabled':'Disabled')}${pair('Player telemetry',data.player_telemetry_enabled?'Enabled':'Disabled')}${pair('Network telemetry',data.player_network_telemetry_enabled?'Enabled':'Disabled')}${pair('Position telemetry',data.player_position_telemetry_enabled?'Enabled':'Disabled')}${pair('Snapshot interval',`${fmtInt(data.player_snapshot_interval_seconds)} seconds`)}${pair('Telemetry retention',`${fmtInt(data.player_telemetry_retention_days)} days`)}${pair('Snapshot history cap',fmtInt(data.player_snapshot_history_limit))}${pair('Admin audit retention',`${fmtInt(data.admin_audit_retention_days)} days`)}${pair('Player IP collection',data.player_ip_collection_supported?'Supported':'Not exposed by DayZ API')}${pair('Live player control',data.live_player_control_enabled?'Enabled':'Disabled')}${pair('Command expiry',`${fmtInt(data.player_command_expiry_seconds)} seconds`)}`;
+    const editable=saved.available?`
+      <section class="panel"><div class="panel-head"><h2>Server owner settings</h2><span class="muted">Saved in ${esc(saved.file_name||'ClippyServerManager.json')}</span></div><div class="panel-body">
+        <div class="settings-section"><h3>Admin Panel</h3><div class="settings-grid">
+          ${check('settingAdminEnabled','Enable Admin Panel',saved.admin_panel_enabled,'Takes effect the next time the manager starts or opens the Admin Panel.')}
+          ${number('settingPort','Admin Panel port',saved.port,1024,65535,'Must not match the StorageHost or PostgreSQL port.')}
+          ${check('settingEditing','Enable stored-cargo editing',saved.enable_editing,'Uses maintenance locks, revision checks, and domain write operations.')}
+          ${check('settingAutoBrowser','Open browser automatically',saved.auto_open_browser,'Applies the next time the manager opens the Admin Panel.')}
+          ${number('settingIdle','Idle shutdown minutes',saved.idle_shutdown_minutes,5,240)}
+          ${number('settingHttpThreads','Admin HTTP threads',saved.http_threads,2,32)}
+          ${number('settingQueued','Maximum queued requests',saved.max_queued_requests,16,4096)}
+          ${number('settingMaxRequest','Maximum request bytes',saved.max_request_bytes,4096,1048576)}
+        </div></div>
+        <div class="settings-section"><h3>Admin PostgreSQL limits</h3><div class="settings-grid">
+          ${number('settingReadPool','PostgreSQL read pool',saved.postgres_pool_size,2,12)}
+          ${number('settingConnectTimeout','Connect timeout seconds',saved.postgres_connect_timeout_seconds,1,15)}
+          ${number('settingStatementTimeout','Read statement timeout ms',saved.postgres_statement_timeout_ms,100,10000)}
+          ${number('settingLockTimeout','Read lock timeout ms',saved.postgres_lock_timeout_ms,50,3000)}
+          ${number('settingIdleTransaction','Idle transaction timeout ms',saved.postgres_idle_transaction_timeout_ms,1000,30000)}
+          ${number('settingLock','Maintenance lock seconds',saved.maintenance_lock_seconds,30,900)}
+          ${number('settingWritePool','PostgreSQL write pool',saved.postgres_write_pool_size,1,4)}
+          ${number('settingWriteStatement','Write statement timeout ms',saved.postgres_write_statement_timeout_ms,500,15000)}
+          ${number('settingWriteLock','Write lock timeout ms',saved.postgres_write_lock_timeout_ms,100,5000)}
+        </div></div>
+        <div class="settings-section"><h3>Player telemetry and live controls</h3><div class="settings-grid">
+          ${check('settingTelemetry','Enable player telemetry',saved.enable_player_telemetry,'Required for player snapshots and live controls.')}
+          ${check('settingNetwork','Collect network telemetry',saved.enable_player_network_telemetry,'Ping, bandwidth estimates, and output throttle from DayZ PlayerIdentity.')}
+          ${check('settingPosition','Collect player position',saved.enable_player_position_telemetry,'Map and world position in telemetry snapshots.')}
+          ${check('settingLive','Enable live player controls',saved.enable_live_player_control,'Requires player telemetry. Commands execute inside DayZ.')}
+          ${number('settingSnapshotInterval','Snapshot interval seconds',saved.player_snapshot_interval_seconds,30,3600)}
+          ${number('settingRetention','Telemetry retention days',saved.player_telemetry_retention_days,1,3650)}
+          ${number('settingHistory','Snapshot history per player',saved.player_snapshot_history_limit,2,10000)}
+          ${number('settingAuditRetention','Admin audit retention days',saved.admin_audit_retention_days,7,3650)}
+          ${number('settingPoll','Live command poll seconds',saved.player_command_poll_interval_seconds,1,30)}
+          ${number('settingExpiry','Live command expiry seconds',saved.player_command_expiry_seconds,5,300)}
+        </div></div>
+        <label class="field settings-reason"><span>Change note</span><input id="settingReason" maxlength="512" placeholder="Optional note for the admin audit log"></label>
+        <div class="settings-actions"><span class="muted" id="settingsDirtyState">No unsaved changes.</span><button class="button" id="settingsReset" disabled>Reset</button><button class="button primary" id="settingsApply" disabled>Apply changes</button></div>
+      </div></section>
+      <div class="notice warn">Apply updates only the allowlisted settings shown above in ClippyServerManager.json and keeps a safety copy beside it. If another process changes the JSON after this page loads, the save is rejected instead of overwriting it. The page reloads after saving. Reopen the Admin Panel to apply AdminHost listener, pool, timeout, and editing changes. Restart DayZ through START-CLIPPY-SERVER.bat to apply DayZ telemetry and live-control changes.</div>`
+      : `<div class="notice warn">This AdminHost was not given an editable ClippyServerManager.json path. Open it through the 1.0.1 server manager to edit settings here.</div>`;
+    setContent(`${pageHead('Settings','View effective runtime settings and edit the safe server-owner settings stored in ClippyServerManager.json.')}
+      ${pendingRuntime?'<div class="notice warn">ClippyServerManager.json contains saved settings that are not active in this AdminHost process yet. Reopen the Admin Panel to apply AdminHost changes. DayZ-side telemetry changes take effect after the managed DayZ server is restarted.</div>':''}
+      <section class="panel"><div class="panel-head"><h2>Effective runtime</h2><span class="muted">Current process values</span></div><div class="panel-body detail-grid">${runtimePairs}</div></section>
+      ${editable}
+      <div class="notice">Database passwords, StorageHost tokens, signing material, server executable paths, PostgreSQL installation settings, and unrestricted JSON fields are not exposed or writable from this page.</div>`);
+    if(!saved.available)return;
+
+    const readForm=()=>({
+      admin_panel_enabled:document.getElementById('settingAdminEnabled').checked,
+      port:Number(document.getElementById('settingPort').value),
+      enable_editing:document.getElementById('settingEditing').checked,
+      auto_open_browser:document.getElementById('settingAutoBrowser').checked,
+      idle_shutdown_minutes:Number(document.getElementById('settingIdle').value),
+      http_threads:Number(document.getElementById('settingHttpThreads').value),
+      max_queued_requests:Number(document.getElementById('settingQueued').value),
+      max_request_bytes:Number(document.getElementById('settingMaxRequest').value),
+      postgres_pool_size:Number(document.getElementById('settingReadPool').value),
+      postgres_connect_timeout_seconds:Number(document.getElementById('settingConnectTimeout').value),
+      postgres_statement_timeout_ms:Number(document.getElementById('settingStatementTimeout').value),
+      postgres_lock_timeout_ms:Number(document.getElementById('settingLockTimeout').value),
+      postgres_idle_transaction_timeout_ms:Number(document.getElementById('settingIdleTransaction').value),
+      maintenance_lock_seconds:Number(document.getElementById('settingLock').value),
+      postgres_write_pool_size:Number(document.getElementById('settingWritePool').value),
+      postgres_write_statement_timeout_ms:Number(document.getElementById('settingWriteStatement').value),
+      postgres_write_lock_timeout_ms:Number(document.getElementById('settingWriteLock').value),
+      enable_player_telemetry:document.getElementById('settingTelemetry').checked,
+      enable_player_network_telemetry:document.getElementById('settingNetwork').checked,
+      enable_player_position_telemetry:document.getElementById('settingPosition').checked,
+      enable_live_player_control:document.getElementById('settingLive').checked,
+      player_snapshot_interval_seconds:Number(document.getElementById('settingSnapshotInterval').value),
+      player_telemetry_retention_days:Number(document.getElementById('settingRetention').value),
+      player_snapshot_history_limit:Number(document.getElementById('settingHistory').value),
+      admin_audit_retention_days:Number(document.getElementById('settingAuditRetention').value),
+      player_command_poll_interval_seconds:Number(document.getElementById('settingPoll').value),
+      player_command_expiry_seconds:Number(document.getElementById('settingExpiry').value)
+    });
+    const initial=JSON.stringify(readForm());
+    const updateDirty=()=>{const dirty=JSON.stringify(readForm())!==initial;document.getElementById('settingsApply').disabled=!dirty;document.getElementById('settingsReset').disabled=!dirty;document.getElementById('settingsDirtyState').textContent=dirty?'Unsaved changes.':'No unsaved changes.';};
+    document.querySelectorAll('.settings-grid input').forEach(input=>{input.addEventListener('input',updateDirty);input.addEventListener('change',updateDirty);});
+    document.getElementById('settingsReset').onclick=()=>renderSettings().catch(showError);
+    document.getElementById('settingsApply').onclick=async()=>{
+      const settings=readForm();
+      if(settings.enable_live_player_control&&!settings.enable_player_telemetry){toast('Live player control requires player telemetry.','warn');return;}
+      const apply=document.getElementById('settingsApply');apply.disabled=true;
+      try{
+        const result=await writeApi('/api/settings',{settings,expected_config_fingerprint:saved.config_fingerprint,reason:document.getElementById('settingReason').value.trim()});
+        if(!result.changed){toast('No settings changed.');return;}
+        toast('Settings saved. Reloading the Admin Panel.');
+        setTimeout(()=>location.reload(),650);
+      }catch(error){apply.disabled=false;toast(error.message,'danger');}
+    };
   }
 
   function openPalette() {

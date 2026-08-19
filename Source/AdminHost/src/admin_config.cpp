@@ -86,6 +86,13 @@ AdminConfig load_admin_config(const std::filesystem::path& path) {
     config.backup_directory = resolve_from_config(absolute, backup);
     const auto exports = bounded_string(document, "exportDirectory", "exports", 1, 2048);
     config.export_directory = resolve_from_config(absolute, exports);
+    const auto manager_config = document.value("managerConfigPath", std::string());
+    if (!manager_config.empty()) {
+        if (manager_config.size() > 2048 || manager_config.find('\0') != std::string::npos) {
+            throw std::runtime_error("managerConfigPath is invalid.");
+        }
+        config.manager_config_path = resolve_from_config(absolute, manager_config);
+    }
     config.editing_enabled = document.value("enableEditing", false);
     config.player_telemetry_enabled = document.value("enablePlayerTelemetry", false);
     config.player_network_telemetry_enabled = document.value("enablePlayerNetworkTelemetry", true);

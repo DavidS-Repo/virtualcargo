@@ -20,6 +20,7 @@ struct AdminConfig {
     std::string dayz_executable_name = "DayZServer_x64.exe";
     std::filesystem::path backup_directory;
     std::filesystem::path export_directory;
+    std::filesystem::path manager_config_path;
     bool editing_enabled = false;
     bool player_telemetry_enabled = false;
     bool player_network_telemetry_enabled = true;

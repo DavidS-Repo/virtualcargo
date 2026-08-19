@@ -11,7 +11,7 @@ $managerRoot = if ($env:CLIPPY_MANAGER_ROOT) { [IO.Path]::GetFullPath($env:CLIPP
 $managerScript = if ($env:CLIPPY_MANAGER_SCRIPT) { [IO.Path]::GetFullPath($env:CLIPPY_MANAGER_SCRIPT) } else { [IO.Path]::GetFullPath((Join-Path $managerRoot 'START-CLIPPY-SERVER.bat')) }
 $rawCommand = if ($Command) { $Command } elseif ($env:CLIPPY_MANAGER_COMMAND) { $env:CLIPPY_MANAGER_COMMAND } else { 'start' }
 $command = $rawCommand.ToLowerInvariant()
-$managerRevision = 20
+$managerRevision = 21
 Write-Host "Clippy Server Manager revision $managerRevision" -ForegroundColor Cyan
 $modName = '@Clippy SQLite Virtual Cargo'
 $workshopId = '3782296362'
@@ -1216,6 +1216,7 @@ function New-DesiredAdminDocument {
         dayzExecutableName = [IO.Path]::GetFileName($config.ServerExecutable.ToString())
         backupDirectory = (Resolve-AbsolutePath -Value $config.StorageHostSettings.BackupDirectory.ToString() -Base $installedHost)
         exportDirectory = (Join-Path $installedAdmin 'exports')
+        managerConfigPath = $configPath
         enableEditing = ([bool]$config.AdminPanel.EnableEditing -and [bool]$script:adminEditingAvailable)
         maintenanceLockSeconds = [int]$config.AdminPanel.MaintenanceLockSeconds
         postgresHost = '127.0.0.1'
@@ -2087,7 +2088,7 @@ function Start-ClippyAdminPanel {
                     $document = Read-JsonFile -Path $installedHostConfig
                     Wait-HostHealthy -HostDocument $document | Out-Null
                 }
-                if (-not (Test-ClippyEditSchemaReady)) { throw 'Clippy PostgreSQL schema did not migrate to version 9 required for safe admin editing.' }
+                if (-not (Test-ClippyEditSchemaReady)) { throw 'Clippy PostgreSQL schema did not migrate to version 11 required for safe admin editing.' }
                 Ensure-PostgreSQLInstalled
                 $editSchemaReady = $true
             }

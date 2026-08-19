@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -30,7 +31,7 @@
 namespace {
 
 using nlohmann::json;
-constexpr const char* admin_version = "1.0.0";
+constexpr const char* admin_version = "1.0.1";
 constexpr const char* cookie_name = "ClippyAdminSession";
 
 struct CliOptions {
@@ -271,6 +272,229 @@ json storage_host_post(const clippy_admin::AdminConfig& config, const std::strin
     return parsed.value("data", json::object());
 }
 
+
+
+bool manager_settings_available(const clippy_admin::AdminConfig& config) {
+    std::error_code error;
+    return !config.manager_config_path.empty() && std::filesystem::is_regular_file(config.manager_config_path, error) && !error;
+}
+
+json manager_settings_view(const clippy_admin::AdminConfig& config) {
+    json result = {{"available", false}};
+    if (!manager_settings_available(config)) {
+        result["note"] = "ClippyServerManager.json was not supplied to this AdminHost instance.";
+        return result;
+    }
+
+    std::string raw;
+    json document;
+    try {
+        raw = clippy::read_text_file(config.manager_config_path);
+        document = json::parse(raw);
+    } catch (const std::exception&) {
+        throw clippy::ApiError(500, "manager_config_invalid", "ClippyServerManager.json could not be read as JSON.");
+    }
+    if (!document.is_object() || document.value("ConfigVersion", 0) != 6) {
+        throw clippy::ApiError(409, "manager_config_version", "ClippyServerManager.json is not a supported version 6 configuration.");
+    }
+    const auto admin = document.value("AdminPanel", json::object());
+    if (!admin.is_object()) throw clippy::ApiError(409, "manager_config_invalid", "ClippyServerManager.json AdminPanel must be an object.");
+
+    result = {
+        {"available", true},
+        {"file_name", config.manager_config_path.filename().string()},
+        {"config_fingerprint", clippy::fingerprint(raw)},
+        {"admin_panel_enabled", admin.value("Enabled", true)},
+        {"port", admin.value("Port", 27817)},
+        {"enable_editing", admin.value("EnableEditing", false)},
+        {"auto_open_browser", admin.value("AutoOpenBrowser", true)},
+        {"idle_shutdown_minutes", admin.value("IdleShutdownMinutes", 30)},
+        {"http_threads", admin.value("HttpThreads", 8)},
+        {"max_queued_requests", admin.value("MaxQueuedRequests", 256)},
+        {"max_request_bytes", admin.value("MaxRequestBytes", 65536)},
+        {"postgres_pool_size", admin.value("PostgresPoolSize", 4)},
+        {"postgres_connect_timeout_seconds", admin.value("PostgresConnectTimeoutSeconds", 3)},
+        {"postgres_statement_timeout_ms", admin.value("PostgresStatementTimeoutMs", 3000)},
+        {"postgres_lock_timeout_ms", admin.value("PostgresLockTimeoutMs", 500)},
+        {"postgres_idle_transaction_timeout_ms", admin.value("PostgresIdleTransactionTimeoutMs", 5000)},
+        {"maintenance_lock_seconds", admin.value("MaintenanceLockSeconds", 300)},
+        {"postgres_write_pool_size", admin.value("PostgresWritePoolSize", 2)},
+        {"postgres_write_statement_timeout_ms", admin.value("PostgresWriteStatementTimeoutMs", 5000)},
+        {"postgres_write_lock_timeout_ms", admin.value("PostgresWriteLockTimeoutMs", 1500)},
+        {"enable_player_telemetry", admin.value("EnablePlayerTelemetry", false)},
+        {"enable_player_network_telemetry", admin.value("EnablePlayerNetworkTelemetry", true)},
+        {"enable_player_position_telemetry", admin.value("EnablePlayerPositionTelemetry", true)},
+        {"player_snapshot_interval_seconds", admin.value("PlayerSnapshotIntervalSeconds", 120)},
+        {"player_telemetry_retention_days", admin.value("PlayerTelemetryRetentionDays", 30)},
+        {"player_snapshot_history_limit", admin.value("PlayerSnapshotHistoryLimit", 250)},
+        {"admin_audit_retention_days", admin.value("AdminAuditRetentionDays", 90)},
+        {"enable_live_player_control", admin.value("EnableLivePlayerControl", false)},
+        {"player_command_poll_interval_seconds", admin.value("PlayerCommandPollIntervalSeconds", 2)},
+        {"player_command_expiry_seconds", admin.value("PlayerCommandExpirySeconds", 30)}
+    };
+    return result;
+}
+
+bool request_bool(const json& body, const char* key) {
+    if (!body.contains(key) || !body[key].is_boolean()) throw clippy::ApiError(400, "invalid_setting", std::string(key) + " must be true or false.");
+    return body[key].get<bool>();
+}
+
+int request_setting_int(const json& body, const char* key, int minimum, int maximum) {
+    if (!body.contains(key) || !body[key].is_number_integer()) throw clippy::ApiError(400, "invalid_setting", std::string(key) + " must be an integer.");
+    const auto value = body[key].get<long long>();
+    if (value < minimum || value > maximum) throw clippy::ApiError(400, "invalid_setting", std::string(key) + " is outside the allowed range.");
+    return static_cast<int>(value);
+}
+
+void replace_text_file(const std::filesystem::path& path, std::string_view contents) {
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+    const auto temporary = std::filesystem::path(path.string() + ".tmp-" + clippy::random_hex(8));
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) throw clippy::ApiError(500, "config_write_failed", "Could not create a temporary manager configuration file.");
+        output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        output.flush();
+        if (!output) {
+            std::error_code remove_error;
+            std::filesystem::remove(temporary, remove_error);
+            throw clippy::ApiError(500, "config_write_failed", "Could not finish writing the manager configuration file.");
+        }
+    }
+#ifdef _WIN32
+    if (!MoveFileExW(temporary.wstring().c_str(), path.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::error_code remove_error;
+        std::filesystem::remove(temporary, remove_error);
+        throw clippy::ApiError(500, "config_write_failed", "Windows could not replace ClippyServerManager.json.");
+    }
+#else
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, path, rename_error);
+    if (rename_error) {
+        std::filesystem::remove(temporary);
+        throw clippy::ApiError(500, "config_write_failed", "Could not replace ClippyServerManager.json.");
+    }
+#endif
+}
+
+json update_manager_settings(const clippy_admin::AdminConfig& config, const json& body) {
+    if (!manager_settings_available(config)) {
+        throw clippy::ApiError(409, "manager_config_unavailable", "This AdminHost instance does not have an editable ClippyServerManager.json path.");
+    }
+    if (!body.contains("settings") || !body["settings"].is_object()) {
+        throw clippy::ApiError(400, "invalid_setting", "settings must be a JSON object.");
+    }
+    if (!body.contains("expected_config_fingerprint") || !body["expected_config_fingerprint"].is_string()) {
+        throw clippy::ApiError(400, "config_fingerprint_required", "expected_config_fingerprint is required. Reload Settings and try again.");
+    }
+    const auto expected_fingerprint = body["expected_config_fingerprint"].get<std::string>();
+    if (expected_fingerprint.size() != 64) {
+        throw clippy::ApiError(400, "config_fingerprint_invalid", "expected_config_fingerprint is invalid.");
+    }
+    const auto& requested = body["settings"];
+
+    std::string raw;
+    json document;
+    try {
+        raw = clippy::read_text_file(config.manager_config_path);
+        if (!clippy::constant_time_equal(clippy::fingerprint(raw), expected_fingerprint)) {
+            throw clippy::ApiError(409, "manager_config_changed", "ClippyServerManager.json changed after this Settings page was loaded. Reload the page before saving.", true);
+        }
+        document = json::parse(raw);
+    } catch (const clippy::ApiError&) { throw; }
+    catch (const std::exception&) {
+        throw clippy::ApiError(500, "manager_config_invalid", "ClippyServerManager.json could not be read as JSON.");
+    }
+    if (!document.is_object() || document.value("ConfigVersion", 0) != 6) {
+        throw clippy::ApiError(409, "manager_config_version", "ClippyServerManager.json is not a supported version 6 configuration.");
+    }
+    if (!document.contains("AdminPanel") || !document["AdminPanel"].is_object()) document["AdminPanel"] = json::object();
+    auto& admin = document["AdminPanel"];
+    json changed = json::array();
+
+    auto set_bool = [&](const char* request_key, const char* document_key) {
+        if (!requested.contains(request_key)) return;
+        const bool value = request_bool(requested, request_key);
+        if (!admin.contains(document_key) || !admin[document_key].is_boolean() || admin[document_key].get<bool>() != value) {
+            admin[document_key] = value;
+            changed.push_back(request_key);
+        }
+    };
+    auto set_int = [&](const char* request_key, const char* document_key, int minimum, int maximum) {
+        if (!requested.contains(request_key)) return;
+        const int value = request_setting_int(requested, request_key, minimum, maximum);
+        if (!admin.contains(document_key) || !admin[document_key].is_number_integer() || admin[document_key].get<long long>() != value) {
+            admin[document_key] = value;
+            changed.push_back(request_key);
+        }
+    };
+
+    set_bool("admin_panel_enabled", "Enabled");
+    set_int("port", "Port", 1024, 65535);
+    set_bool("enable_editing", "EnableEditing");
+    set_bool("auto_open_browser", "AutoOpenBrowser");
+    set_int("idle_shutdown_minutes", "IdleShutdownMinutes", 5, 240);
+    set_int("http_threads", "HttpThreads", 2, 32);
+    set_int("max_queued_requests", "MaxQueuedRequests", 16, 4096);
+    set_int("max_request_bytes", "MaxRequestBytes", 4096, 1048576);
+    set_int("postgres_pool_size", "PostgresPoolSize", 2, 12);
+    set_int("postgres_connect_timeout_seconds", "PostgresConnectTimeoutSeconds", 1, 15);
+    set_int("postgres_statement_timeout_ms", "PostgresStatementTimeoutMs", 100, 10000);
+    set_int("postgres_lock_timeout_ms", "PostgresLockTimeoutMs", 50, 3000);
+    set_int("postgres_idle_transaction_timeout_ms", "PostgresIdleTransactionTimeoutMs", 1000, 30000);
+    set_int("maintenance_lock_seconds", "MaintenanceLockSeconds", 30, 900);
+    set_int("postgres_write_pool_size", "PostgresWritePoolSize", 1, 4);
+    set_int("postgres_write_statement_timeout_ms", "PostgresWriteStatementTimeoutMs", 500, 15000);
+    set_int("postgres_write_lock_timeout_ms", "PostgresWriteLockTimeoutMs", 100, 5000);
+    set_bool("enable_player_telemetry", "EnablePlayerTelemetry");
+    set_bool("enable_player_network_telemetry", "EnablePlayerNetworkTelemetry");
+    set_bool("enable_player_position_telemetry", "EnablePlayerPositionTelemetry");
+    set_int("player_snapshot_interval_seconds", "PlayerSnapshotIntervalSeconds", 30, 3600);
+    set_int("player_telemetry_retention_days", "PlayerTelemetryRetentionDays", 1, 3650);
+    set_int("player_snapshot_history_limit", "PlayerSnapshotHistoryLimit", 2, 10000);
+    set_int("admin_audit_retention_days", "AdminAuditRetentionDays", 7, 3650);
+    set_bool("enable_live_player_control", "EnableLivePlayerControl");
+    set_int("player_command_poll_interval_seconds", "PlayerCommandPollIntervalSeconds", 1, 30);
+    set_int("player_command_expiry_seconds", "PlayerCommandExpirySeconds", 5, 300);
+
+    const bool telemetry_enabled = admin.value("EnablePlayerTelemetry", false);
+    const bool live_enabled = admin.value("EnableLivePlayerControl", false);
+    if (live_enabled && !telemetry_enabled) {
+        throw clippy::ApiError(400, "invalid_setting", "Live player control requires player telemetry to be enabled.");
+    }
+    const int admin_port = admin.value("Port", 27817);
+    const auto storage = document.value("StorageHostSettings", json::object());
+    const auto postgres = document.value("PostgreSQL", json::object());
+    const int storage_port = storage.is_object() ? storage.value("Port", 27815) : 27815;
+    const int postgres_port = postgres.is_object() ? postgres.value("Port", 27816) : 27816;
+    if (admin_port == storage_port || admin_port == postgres_port) {
+        throw clippy::ApiError(400, "invalid_setting", "Admin Panel port must be different from the StorageHost and PostgreSQL ports.");
+    }
+
+    if (!changed.empty()) {
+        std::string current_raw;
+        try { current_raw = clippy::read_text_file(config.manager_config_path); }
+        catch (const std::exception&) {
+            throw clippy::ApiError(500, "manager_config_invalid", "ClippyServerManager.json could not be re-read before saving.");
+        }
+        if (!clippy::constant_time_equal(clippy::fingerprint(current_raw), expected_fingerprint)) {
+            throw clippy::ApiError(409, "manager_config_changed", "ClippyServerManager.json changed while these settings were being saved. Reload Settings and try again.", true);
+        }
+        std::error_code copy_error;
+        const auto backup = std::filesystem::path(config.manager_config_path.string() + ".before-admin-settings.bak");
+        std::filesystem::copy_file(config.manager_config_path, backup, std::filesystem::copy_options::overwrite_existing, copy_error);
+        if (copy_error) throw clippy::ApiError(500, "config_backup_failed", "Could not create the safety copy of ClippyServerManager.json.");
+        replace_text_file(config.manager_config_path, document.dump(2) + "\n");
+    }
+
+    auto saved = manager_settings_view(config);
+    saved["changed"] = !changed.empty();
+    saved["changed_fields"] = std::move(changed);
+    saved["restart_required"] = saved["changed"].get<bool>();
+    saved["restart_note"] = "Changes are saved to ClippyServerManager.json. Reopen the Admin Panel, and restart DayZ through START-CLIPPY-SERVER.bat for DayZ-side telemetry changes.";
+    return saved;
+}
+
 json list_backups(const clippy_admin::AdminConfig& config) {
     json rows = json::array();
     std::error_code error;
@@ -502,7 +726,15 @@ int main(int argc, char** argv) {
                         {"storage_host_address",config.storage_host_address},{"storage_host_port",config.storage_host_port},
                         {"postgres_host",config.postgres.postgres_host},{"postgres_port",config.postgres.postgres_port},
                         {"postgres_database",config.postgres.postgres_database},{"postgres_read_role",config.postgres.postgres_user},
-                        {"postgres_read_pool_size",config.postgres.postgres_pool_size},{"editing_enabled",database.editing_enabled()},
+                        {"postgres_read_pool_size",config.postgres.postgres_pool_size},
+                        {"postgres_connect_timeout_seconds",config.postgres.postgres_connect_timeout_seconds},
+                        {"postgres_statement_timeout_ms",config.postgres.postgres_statement_timeout_ms},
+                        {"postgres_lock_timeout_ms",config.postgres.postgres_lock_timeout_ms},
+                        {"postgres_idle_transaction_timeout_ms",config.postgres.postgres_idle_transaction_timeout_ms},
+                        {"postgres_write_pool_size",config.postgres_write.postgres_pool_size},
+                        {"postgres_write_statement_timeout_ms",config.postgres_write.postgres_statement_timeout_ms},
+                        {"postgres_write_lock_timeout_ms",config.postgres_write.postgres_lock_timeout_ms},
+                        {"editing_enabled",database.editing_enabled()},
                         {"maintenance_lock_seconds",config.maintenance_lock_seconds},{"export_directory",config.export_directory.string()},
                         {"player_telemetry_enabled",config.player_telemetry_enabled},
                         {"player_network_telemetry_enabled",config.player_network_telemetry_enabled},
@@ -515,7 +747,17 @@ int main(int argc, char** argv) {
                         {"admin_audit_retention_days",config.admin_audit_retention_days},
                         {"player_ip_collection_supported",false},
                         {"player_ip_collection_note","The supported DayZ server script API does not expose player IP addresses to this mod."},
-                        {"dayz_executable_name",config.dayz_executable_name}};
+                        {"dayz_executable_name",config.dayz_executable_name},
+                        {"manager_settings",manager_settings_view(config)}};
+        });
+        api_write("/api/settings", "update_manager_settings", "configuration",
+                  [](const httplib::Request&) { return std::string("ClippyServerManager.json"); },
+                  [&](const httplib::Request&, const json& body, const std::string& session_id, const std::string& request_id) {
+            auto result = update_manager_settings(config, body);
+            database.record_external_audit(session_id, windows_identity, "update_manager_settings", "configuration", "ClippyServerManager.json",
+                                           "SUCCESS", body_string(body,"reason",512,false), "", request_id,
+                                           {{"changed_fields",result.value("changed_fields",json::array())}});
+            return result;
         });
         api_get("/api/containers", [&](const httplib::Request& request) {
             return database.containers(bounded_query_string(request, "q", 128), bounded_query_string(request, "after", 128),
