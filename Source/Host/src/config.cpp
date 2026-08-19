@@ -55,6 +55,9 @@ HostConfig load_config(const std::filesystem::path& path) {
     config.max_queued_requests = bounded_int(document, "maxQueuedRequests", 1024, 16, 65536);
     config.max_backup_files = bounded_int(document, "maxBackupFiles", 10, 1, 1000);
     config.terminal_retention_days = bounded_int(document, "terminalRetentionDays", 30, 1, 3650);
+    config.player_telemetry_retention_days = bounded_int(document, "playerTelemetryRetentionDays", 30, 1, 3650);
+    config.player_snapshot_history_limit = bounded_int(document, "playerSnapshotHistoryLimit", 250, 2, 10000);
+    config.admin_audit_retention_days = bounded_int(document, "adminAuditRetentionDays", 90, 7, 3650);
     config.maintenance_prune_batch_rows = bounded_int(document, "maintenancePruneBatchRows", 500, 10, 10000);
     config.maintenance_interval_seconds = bounded_int(document, "maintenanceIntervalSeconds", 300, 30, 86400);
     config.max_request_bytes = static_cast<std::size_t>(
@@ -118,6 +121,9 @@ void create_default_config(const std::filesystem::path& path) {
         {"maxQueuedRequests", 1024},
         {"maxBackupFiles", 10},
         {"terminalRetentionDays", 30},
+        {"playerTelemetryRetentionDays", 30},
+        {"playerSnapshotHistoryLimit", 250},
+        {"adminAuditRetentionDays", 90},
         {"maintenancePruneBatchRows", 500},
         {"maintenanceIntervalSeconds", 300},
         {"maxRequestBytes", 2 * 1024 * 1024},

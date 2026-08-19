@@ -30,6 +30,9 @@ struct HostConfig {
     int max_queued_requests = 1024;
     int max_backup_files = 10;
     int terminal_retention_days = 30;
+    int player_telemetry_retention_days = 30;
+    int player_snapshot_history_limit = 250;
+    int admin_audit_retention_days = 90;
     int maintenance_prune_batch_rows = 500;
     int maintenance_interval_seconds = 300;
     std::size_t max_request_bytes = 2 * 1024 * 1024;

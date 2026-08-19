@@ -318,6 +318,121 @@ class CVCItemTreeCodec
         return node;
     }
 
+    static CVCItemNode CaptureLive(ItemBase item)
+    {
+        if (!item)
+            return null;
+
+        CVCItemNode node = new CVCItemNode;
+        node.class_name = item.GetType();
+        node.item_id = item.CVCGetLiveItemID();
+
+        InventoryLocation location = new InventoryLocation;
+        if (item.GetInventory().GetCurrentInventoryLocation(location))
+        {
+            node.location.slot = location.GetSlot();
+            node.location.index = location.GetIdx();
+            node.location.row = location.GetRow();
+            node.location.col = location.GetCol();
+            node.location.flip = location.GetFlip();
+            if (location.GetType() == InventoryLocationType.ATTACHMENT)
+                node.location.kind = "attachment";
+            else if (location.GetType() == InventoryLocationType.HANDS)
+                node.location.kind = "hands";
+            else
+                node.location.kind = "cargo";
+        }
+
+        CVCWorldItemAdapter adapter = CVCItemAdapterRegistry.ResolveForItem(item);
+        node.adapter.id = adapter.GetID();
+        node.adapter.version = adapter.GetVersion();
+        adapter.Serialize(item, node);
+
+        GameInventory inventory = item.GetInventory();
+        for (int attachmentIndex = 0; attachmentIndex < inventory.AttachmentCount(); attachmentIndex++)
+        {
+            ItemBase attachment = ItemBase.Cast(inventory.GetAttachmentFromIndex(attachmentIndex));
+            if (attachment)
+                node.children.Insert(CaptureLive(attachment));
+        }
+        CargoBase cargo = inventory.GetCargo();
+        if (cargo)
+        {
+            for (int cargoIndex = 0; cargoIndex < cargo.GetItemCount(); cargoIndex++)
+            {
+                ItemBase cargoItem = ItemBase.Cast(cargo.GetItem(cargoIndex));
+                if (cargoItem)
+                    node.children.Insert(CaptureLive(cargoItem));
+            }
+        }
+        return node;
+    }
+
+    protected static bool RestoreLiveNode(ItemBase item, CVCItemNode node, out string reason)
+    {
+        if (!item || !node)
+        {
+            reason = "created live item or stored node disappeared during restore";
+            return false;
+        }
+        CVCWorldItemAdapter adapter = CVCItemAdapterRegistry.ResolveForNode(node);
+        if (!adapter)
+        {
+            reason = "adapter became unavailable while restoring " + node.class_name;
+            return false;
+        }
+        item.CVCSetLiveItemID(node.item_id);
+        adapter.Restore(item, node);
+        if (!node.children)
+            return true;
+        foreach (CVCItemNode childNode : node.children)
+        {
+            if (!childNode || !childNode.location)
+            {
+                reason = "stored live child data is incomplete";
+                return false;
+            }
+            EntityAI created;
+            if (childNode.location.kind == "attachment" && childNode.location.slot >= 0)
+                created = item.GetInventory().CreateAttachmentEx(childNode.class_name, childNode.location.slot);
+            else if (childNode.location.kind == "cargo")
+                created = item.GetInventory().CreateEntityInCargoEx(childNode.class_name, childNode.location.index, childNode.location.row, childNode.location.col, childNode.location.flip);
+            else
+            {
+                reason = "unsupported stored live child location " + childNode.location.kind + " for " + childNode.class_name;
+                return false;
+            }
+            ItemBase child = ItemBase.Cast(created);
+            if (!child || !RestoreLiveNode(child, childNode, reason))
+                return false;
+        }
+        return true;
+    }
+
+    static ItemBase RestoreLiveRoot(CVCItemNode node, PlayerBase destination, out string reason)
+    {
+        if (!node || !destination)
+        {
+            reason = "stored live item or destination player is missing";
+            return null;
+        }
+        if (!CanRestoreTree(node, reason))
+            return null;
+        EntityAI created = destination.GetInventory().CreateInInventory(node.class_name);
+        ItemBase root = ItemBase.Cast(created);
+        if (!root)
+        {
+            reason = "could not create " + node.class_name + " in the player inventory";
+            return null;
+        }
+        if (!RestoreLiveNode(root, node, reason))
+        {
+            root.DeleteSafe();
+            return null;
+        }
+        return root;
+    }
+
     static ItemBase RestoreRoot(CVCItemNode node, EntityAI destination, out string reason)
     {
         if (!node || !destination)
@@ -524,6 +639,56 @@ class CVCContainerRuntime
     int cleanup_retry_attempt;
     bool cleanup_committed;
     string pending_failure_reason;
+    int last_metadata_report_ms;
+}
+
+class CVCContainerMetadataHandler: CVCResponseHandler
+{
+    override void OnSuccess(string raw) {}
+    override void OnFailure(string reason)
+    {
+        ErrorEx("[Clippy Virtual Cargo] Container metadata update failed: " + reason);
+    }
+}
+
+class CVCContainerMetadata
+{
+    static string MapName()
+    {
+        string worldName = GetGame().GetWorldName();
+        if (worldName == "")
+            return "unknown";
+        return worldName;
+    }
+
+    static void FillResolve(CVCResolveRequest request, EntityAI container)
+    {
+        if (!request || !container)
+            return;
+        vector position = container.GetPosition();
+        request.container_class = container.GetType();
+        request.world_position_x = position[0];
+        request.world_position_y = position[1];
+        request.world_position_z = position[2];
+        request.map_name = MapName();
+    }
+
+    static void Observe(CVCContainerRuntime state)
+    {
+        if (!state || !state.container || state.storage_id == "" || !ClippyVirtualCargoAPI.IsReady())
+            return;
+        CVCContainerObservationRequest request = new CVCContainerObservationRequest;
+        request.storage_id = state.storage_id;
+        request.display_name = state.container.GetDisplayName();
+        request.container_class = state.container.GetType();
+        vector position = state.container.GetPosition();
+        request.world_position_x = position[0];
+        request.world_position_y = position[1];
+        request.world_position_z = position[2];
+        request.map_name = MapName();
+        state.last_metadata_report_ms = GetGame().GetTime();
+        ClippyVirtualCargoAPI.Post("/v1/storage/observe", request, new CVCContainerMetadataHandler);
+    }
 }
 
 class CVCPhysicalRootIdentity
@@ -1372,6 +1537,7 @@ class CVCContainerService
             request.provider_key = state.provider_key;
             request.display_name = container.GetDisplayName();
             request.capacity_slots = CVCSettingsManager.Get().VirtualRootCapacity;
+            CVCContainerMetadata.FillResolve(request, container);
             if (!ClippyVirtualCargoAPI.Post("/v1/storage/resolve", request, new CVCNativeResolveHandler(state, nextPage)))
                 Fail(state, "API is not ready");
             return;
@@ -2236,10 +2402,15 @@ class CVCContainerService
     {
         if (!GetGame().IsServer())
             return;
+        int nowMs = GetGame().GetTime();
         foreach (string key, CVCContainerRuntime state : s_States)
         {
-            if (state && state.container && state.phase == PHASE_ACTIVE && (!state.player || !CVCContainerPolicy.CanAccess(state.container, state.player)))
+            if (!state || !state.container)
+                continue;
+            if (state.phase == PHASE_ACTIVE && (!state.player || !CVCContainerPolicy.CanAccess(state.container, state.player)))
                 Commit(state);
+            if (state.storage_id != "" && (state.last_metadata_report_ms == 0 || nowMs - state.last_metadata_report_ms >= 60000))
+                CVCContainerMetadata.Observe(state);
         }
     }
 }
@@ -2587,6 +2758,7 @@ class CVCMigrationService
             resolve.provider_key = state.provider_key;
             resolve.display_name = container.GetDisplayName();
             resolve.capacity_slots = CVCSettingsManager.Get().VirtualRootCapacity;
+            CVCContainerMetadata.FillResolve(resolve, state.container);
             if (!ClippyVirtualCargoAPI.Post("/v1/storage/resolve", resolve, new CVCMigrationResolveHandler(state)))
                 Fail(state, "could not dispatch container resolve");
             return;
@@ -2940,6 +3112,7 @@ class CVCMigrationService
             resolve.provider_key = state.provider_key;
             resolve.display_name = state.container.GetDisplayName();
             resolve.capacity_slots = CVCSettingsManager.Get().VirtualRootCapacity;
+            CVCContainerMetadata.FillResolve(resolve, state.container);
             if (!ClippyVirtualCargoAPI.Post("/v1/storage/resolve", resolve, new CVCMigrationResolveHandler(state)))
                 Fail(state, "could not retry container resolve");
             return;
@@ -3074,6 +3247,7 @@ class ActionCVCRetrySave: ActionSingleUseBase
 modded class ItemBase
 {
     protected string m_CVCVirtualItemID;
+    protected string m_CVCLiveItemID;
     protected int m_CVCActionState;
     protected bool m_CVCManagedShell;
     protected bool m_CVCPreviousAllowDamage;
@@ -3086,6 +3260,24 @@ modded class ItemBase
 
     string CVCGetVirtualItemID() { return m_CVCVirtualItemID; }
     void CVCSetVirtualItemID(string itemID) { m_CVCVirtualItemID = itemID; }
+    void CVCSetLiveItemID(string itemID) { m_CVCLiveItemID = itemID; }
+    string CVCGetLiveItemID()
+    {
+        if (m_CVCVirtualItemID != "")
+            return m_CVCVirtualItemID;
+        if (m_CVCLiveItemID != "")
+            return m_CVCLiveItemID;
+        int a;
+        int b;
+        int c;
+        int d;
+        GetPersistentID(a, b, c, d);
+        if (a != 0 || b != 0 || c != 0 || d != 0)
+            m_CVCLiveItemID = string.Format("live:%1:%2:%3:%4:%5", GetType(), a, b, c, d);
+        else
+            m_CVCLiveItemID = string.Format("live:%1:%2:%3", GetType(), GetGame().GetTime(), Math.RandomInt(100000, 999999));
+        return m_CVCLiveItemID;
+    }
     int CVCGetActionState() { return m_CVCActionState; }
     bool CVCIsManagedShell() { return m_CVCManagedShell; }
     void CVCSetManagedShell(bool managed)

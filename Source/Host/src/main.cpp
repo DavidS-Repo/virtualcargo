@@ -17,8 +17,8 @@
 namespace {
 
 using nlohmann::json;
-constexpr const char* host_version = "0.5.1";
-constexpr const char* protocol_version = "1.0";
+constexpr const char* host_version = "1.0.0";
+constexpr const char* protocol_version = "1.1";
 
 std::atomic<bool> stopping = false;
 httplib::Server* active_server = nullptr;
@@ -194,12 +194,16 @@ int main(int argc, char** argv) {
                 {"session_states", {"OPEN", "MATERIALIZED", "COMMITTED", "CLEANED", "ABORTED"}},
                 {"migration_states", {"PREPARED", "COMMITTED", "CLEANED"}},
                 {"item_tree_schema", 1},
+                {"container_metadata", true},
+                {"player_telemetry", true},
+                {"player_command_bridge", true},
                 {"default_adapter", {{"id", "dayz.state-v2"}, {"version", 1}}},
                 {"limits", {{"max_request_bytes", config.max_request_bytes},
                             {"max_item_nodes", config.max_item_nodes}, {"max_page_nodes", config.max_page_nodes}, {"max_item_depth", config.max_item_depth}}},
             };
         }));
         server.Post("/v1/storage/resolve", endpoint(config, [&database](const json& body) { return database.resolve_container(body); }));
+        server.Post("/v1/storage/observe", endpoint(config, [&database](const json& body) { return database.observe_container(body); }));
         server.Post("/v1/storage/snapshot", endpoint(config, [&database](const json& body) { return database.snapshot(body); }));
         server.Post("/v1/item/tree", endpoint(config, [&database](const json& body) { return database.item_tree(body); }));
         server.Post("/v1/operation/deposit/prepare", endpoint(config, [&database](const json& body) { return database.prepare_deposit(body); }));
@@ -225,6 +229,7 @@ int main(int argc, char** argv) {
         server.Post("/v1/admin/item-index/rebuild-batch", endpoint(config, [&database](const json& body) { return database.rebuild_item_index_batch(body); }));
         server.Post("/v1/admin/integrity", endpoint(config, [&database](const json&) { return database.quick_check(); }));
         server.Post("/v1/admin/backup", endpoint(config, [&database](const json& body) { return database.backup(body); }));
+        server.Post("/v1/admin/backup/verify", endpoint(config, [&database](const json& body) { return database.verify_backup(body); }));
         server.Post("/v1/admin/checkpoint", endpoint(config, [&database](const json&) {
             database.checkpoint();
             return json{{"checkpointed", false}, {"managed_by", "postgresql"}};
@@ -238,6 +243,9 @@ int main(int argc, char** argv) {
             }).detach();
             return json{{"stopping", true}};
         }));
+        server.Post("/v1/player/snapshot", endpoint(config, [&database](const json& body) { return database.player_snapshot(body); }));
+        server.Post("/v1/player/commands/poll", endpoint(config, [&database](const json& body) { return database.poll_player_commands(body); }));
+        server.Post("/v1/player/commands/complete", endpoint(config, [&database](const json& body) { return database.complete_player_command(body); }));
         server.Post("/v1/metrics", endpoint(config, [&database](const json& body) { return database.metrics(body); }));
 
         server.set_error_handler([](const httplib::Request&, httplib::Response& response) {

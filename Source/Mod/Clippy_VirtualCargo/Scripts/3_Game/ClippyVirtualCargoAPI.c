@@ -1,6 +1,6 @@
 class CVCSettings
 {
-    int Version = 5;
+    int Version = 7;
     bool Enabled = true;
     string HostURL = "http://127.0.0.1:27815";
     string ApiToken = "COPY_API_TOKEN_FROM_ClippyStorageHost.json";
@@ -25,6 +25,13 @@ class CVCSettings
     bool ReportUnlistedStorageCandidates = false;
     bool ReportEmptyUnlistedStorageCandidates = false;
     int MinimumUnlistedPhysicalRoots = 1;
+    bool EnablePlayerTelemetry = false;
+    bool EnablePlayerNetworkTelemetry = true;
+    bool EnablePlayerPositionTelemetry = true;
+    int PlayerSnapshotIntervalSeconds = 120;
+    bool EnableLivePlayerControl = false;
+    int PlayerCommandPollIntervalSeconds = 2;
+    int PlayerCommandExpirySeconds = 30;
     ref array<string> ContainerClassNames;
     ref array<string> ExcludedContainerClassNames;
     ref array<string> BlockedItemClassNames;
@@ -121,6 +128,22 @@ class CVCResolveRequest: CVCRequestBase
     string provider_key;
     string display_name;
     int capacity_slots;
+    string container_class;
+    float world_position_x;
+    float world_position_y;
+    float world_position_z;
+    string map_name;
+}
+
+class CVCContainerObservationRequest: CVCRequestBase
+{
+    string storage_id;
+    string display_name;
+    string container_class;
+    float world_position_x;
+    float world_position_y;
+    float world_position_z;
+    string map_name;
 }
 
 class CVCSnapshotRequest: CVCRequestBase
@@ -236,6 +259,101 @@ class CVCItemNode
     ref CVCItemAdapter adapter = new CVCItemAdapter;
     ref CVCItemState state = new CVCItemState;
     ref array<ref CVCItemNode> children = new array<ref CVCItemNode>;
+}
+
+class CVCPlayerCommandPayload
+{
+    string item_id;
+    string class_name;
+    string target_player_id;
+    float health = 1.0;
+    float quantity = -1.0;
+    string quarantine_id;
+    ref CVCItemNode item_tree;
+}
+
+class CVCPlayerCommandResult
+{
+    string item_id;
+    string created_item_id;
+    string target_player_id;
+    string quarantine_id;
+    ref CVCItemNode item_tree;
+}
+
+class CVCPlayerProfileTelemetry
+{
+    string plain_name;
+    string full_name;
+    int session_player_id = -1;
+}
+
+class CVCPlayerNetworkTelemetry
+{
+    bool available = false;
+    int ping_act_ms = 0;
+    int ping_min_ms = 0;
+    int ping_max_ms = 0;
+    int ping_avg_ms = 0;
+    int bandwidth_min_kbps = 0;
+    int bandwidth_max_kbps = 0;
+    int bandwidth_avg_kbps = 0;
+    float output_throttle = 0.0;
+}
+
+class CVCPlayerPositionTelemetry
+{
+    bool available = false;
+    string map_name;
+    float world_position_x = 0.0;
+    float world_position_y = 0.0;
+    float world_position_z = 0.0;
+}
+
+class CVCPlayerSnapshotRequest: CVCRequestBase
+{
+    string player_id;
+    string display_name;
+    ref CVCPlayerProfileTelemetry profile = new CVCPlayerProfileTelemetry;
+    ref CVCPlayerNetworkTelemetry network = new CVCPlayerNetworkTelemetry;
+    ref CVCPlayerPositionTelemetry position = new CVCPlayerPositionTelemetry;
+    ref array<ref CVCItemNode> inventory = new array<ref CVCItemNode>;
+    ref map<string,string> equipment = new map<string,string>;
+}
+
+class CVCPlayerCommandPollRequest: CVCRequestBase
+{
+    string player_id;
+    int limit = 4;
+}
+
+class CVCPlayerCommandCompleteRequest: CVCRequestBase
+{
+    string command_id;
+    string player_id;
+    string status;
+    string result_json;
+    string error;
+}
+
+class CVCPlayerCommandData
+{
+    string command_id;
+    string action;
+    string payload_json;
+}
+
+class CVCPlayerCommandListData
+{
+    string player_id;
+    ref array<ref CVCPlayerCommandData> commands = new array<ref CVCPlayerCommandData>;
+}
+
+class CVCPlayerCommandListEnvelope
+{
+    bool ok;
+    ref CVCPlayerCommandListData data;
+    ref CVCErrorData error;
 }
 
 class CVCDepositPrepareRequest: CVCRequestBase
@@ -514,6 +632,10 @@ class ClippyVirtualCargoAPI
         CVCMigrationPrepareRequest migrationPrepareRequest = CVCMigrationPrepareRequest.Cast(request);
         CVCMigrationObservationRequest observationRequest = CVCMigrationObservationRequest.Cast(request);
         CVCMigrationRequest migrationRequest = CVCMigrationRequest.Cast(request);
+        CVCContainerObservationRequest containerObservationRequest = CVCContainerObservationRequest.Cast(request);
+        CVCPlayerSnapshotRequest playerSnapshotRequest = CVCPlayerSnapshotRequest.Cast(request);
+        CVCPlayerCommandPollRequest playerCommandPollRequest = CVCPlayerCommandPollRequest.Cast(request);
+        CVCPlayerCommandCompleteRequest playerCommandCompleteRequest = CVCPlayerCommandCompleteRequest.Cast(request);
         CVCResolveRequest resolveRequest = CVCResolveRequest.Cast(request);
         CVCSnapshotRequest snapshotRequest = CVCSnapshotRequest.Cast(request);
         CVCItemTreeRequest itemTreeRequest = CVCItemTreeRequest.Cast(request);
@@ -544,6 +666,14 @@ class ClippyVirtualCargoAPI
             serialized = serializer.WriteToString(observationRequest, false, payload);
         else if (migrationRequest)
             serialized = serializer.WriteToString(migrationRequest, false, payload);
+        else if (containerObservationRequest)
+            serialized = serializer.WriteToString(containerObservationRequest, false, payload);
+        else if (playerSnapshotRequest)
+            serialized = serializer.WriteToString(playerSnapshotRequest, false, payload);
+        else if (playerCommandPollRequest)
+            serialized = serializer.WriteToString(playerCommandPollRequest, false, payload);
+        else if (playerCommandCompleteRequest)
+            serialized = serializer.WriteToString(playerCommandCompleteRequest, false, payload);
         else if (resolveRequest)
             serialized = serializer.WriteToString(resolveRequest, false, payload);
         else if (snapshotRequest)

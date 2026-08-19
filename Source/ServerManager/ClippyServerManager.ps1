@@ -1,5 +1,6 @@
 param(
-    [Parameter(Position=0,Mandatory=$false)][string]$Command = ''
+    [Parameter(Position=0,Mandatory=$false)][string]$Command = '',
+    [Parameter(Position=1,Mandatory=$false)][string]$Value = ''
 )
 
 Set-StrictMode -Version Latest
@@ -10,7 +11,7 @@ $managerRoot = if ($env:CLIPPY_MANAGER_ROOT) { [IO.Path]::GetFullPath($env:CLIPP
 $managerScript = if ($env:CLIPPY_MANAGER_SCRIPT) { [IO.Path]::GetFullPath($env:CLIPPY_MANAGER_SCRIPT) } else { [IO.Path]::GetFullPath((Join-Path $managerRoot 'START-CLIPPY-SERVER.bat')) }
 $rawCommand = if ($Command) { $Command } elseif ($env:CLIPPY_MANAGER_COMMAND) { $env:CLIPPY_MANAGER_COMMAND } else { 'start' }
 $command = $rawCommand.ToLowerInvariant()
-$managerRevision = 16
+$managerRevision = 20
 Write-Host "Clippy Server Manager revision $managerRevision" -ForegroundColor Cyan
 $modName = '@Clippy SQLite Virtual Cargo'
 $workshopId = '3782296362'
@@ -152,7 +153,7 @@ function Read-JsonFile {
 function Get-BuiltInConfiguration {
     return @'
 {
-  "ConfigVersion": 5,
+  "ConfigVersion": 6,
   "ServerRoot": "Auto",
   "ServerExecutable": "DayZServer_x64.exe",
   "BaseStartScript": "StartServer.bat",
@@ -173,6 +174,8 @@ function Get-BuiltInConfiguration {
     "PostgresStatementTimeoutMs": 10000, "PostgresLockTimeoutMs": 3000,
     "PostgresIdleTransactionTimeoutMs": 15000,
     "MaxBackupFiles": 10, "TerminalRetentionDays": 30,
+    "PlayerTelemetryRetentionDays": 30, "PlayerSnapshotHistoryLimit": 250,
+    "AdminAuditRetentionDays": 90,
     "MaintenancePruneBatchRows": 500, "MaintenanceIntervalSeconds": 300,
     "MaxRequestBytes": 2097152, "MaxItemNodes": 4096,
     "MaxPageNodes": 256, "MaxItemDepth": 16
@@ -184,7 +187,7 @@ function Get-BuiltInConfiguration {
     "InstallerSHA256": "44B8187D2DB7E866495952D8260A1D7252CBB5125843142E1F0BF30115D23279"
   },
   "VirtualCargoSettings": {
-    "Version": 5, "Enabled": true, "ConnectionTimeoutSeconds": 5,
+    "Version": 7, "Enabled": true, "ConnectionTimeoutSeconds": 5,
     "RequestTimeoutSeconds": 10, "ProviderID": "clippy.dayz.virtual-cargo",
     "VirtualRootCapacity": 10000, "NativePageSize": 20, "MaterializationIntervalMs": 1, "AccessDistanceMetres": 2.0,
     "AutoOpenInventory": true, "RejectContaminatedItems": true,
@@ -205,7 +208,15 @@ function Get-BuiltInConfiguration {
     "HttpThreads": 8, "MaxQueuedRequests": 256, "MaxRequestBytes": 65536,
     "PostgresPoolSize": 4, "PostgresConnectTimeoutSeconds": 3,
     "PostgresStatementTimeoutMs": 3000, "PostgresLockTimeoutMs": 500,
-    "PostgresIdleTransactionTimeoutMs": 5000, "EnableEditing": false
+    "PostgresIdleTransactionTimeoutMs": 5000, "EnableEditing": true,
+    "MaintenanceLockSeconds": 300, "PostgresWritePoolSize": 2,
+    "PostgresWriteStatementTimeoutMs": 5000, "PostgresWriteLockTimeoutMs": 1500,
+    "EnablePlayerTelemetry": false, "EnablePlayerNetworkTelemetry": true,
+    "EnablePlayerPositionTelemetry": true, "PlayerSnapshotIntervalSeconds": 120,
+    "PlayerTelemetryRetentionDays": 30, "PlayerSnapshotHistoryLimit": 250,
+    "AdminAuditRetentionDays": 90,
+    "EnableLivePlayerControl": false, "PlayerCommandPollIntervalSeconds": 2,
+    "PlayerCommandExpirySeconds": 30
   },
   "Persistence": {
     "Path": "Auto", "MissionTemplate": "", "InstanceId": 0,
@@ -287,8 +298,8 @@ function Get-InitialConfiguration {
     } else {
         $sourcePath = $bootstrap
     }
-    $initial.ConfigVersion = 5
-    $initial.VirtualCargoSettings.Version = 5
+    $initial.ConfigVersion = 6
+    $initial.VirtualCargoSettings.Version = 6
     if ($initial.VirtualCargoSettings.PSObject.Properties['ExistingCargoMigrationMode']) {
         $initial.VirtualCargoSettings.PSObject.Properties.Remove('ExistingCargoMigrationMode')
     }
@@ -351,6 +362,8 @@ $postgresPort = [int]$config.PostgreSQL.Port
 $payloadHostExe = Join-Path $payloadHost 'ClippyStorageHost.exe'
 $payloadAdminExe = Join-Path $payloadAdmin 'ClippyAdminHost.exe'
 $adminReadRole = 'clippy_virtual_cargo_admin_read'
+$adminEditRole = 'clippy_virtual_cargo_admin_edit'
+$script:adminEditingAvailable = $false
 $script:managerState = $null
 $script:secrets = $null
 
@@ -411,15 +424,20 @@ function Get-OrCreateSecrets {
     if ($existing -and $existing.PSObject.Properties['PostgresAdminReadPassword'] -and $existing.PostgresAdminReadPassword) { $adminReadPassword = $existing.PostgresAdminReadPassword.ToString() }
     if (-not $adminReadPassword) { $adminReadPassword = New-RandomToken }
 
-    foreach ($pair in @(@('API token',$apiToken), @('PostgreSQL application password',$appPassword), @('PostgreSQL administrator password',$adminPassword), @('PostgreSQL admin read password',$adminReadPassword))) {
+    $adminEditPassword = ''
+    if ($existing -and $existing.PSObject.Properties['PostgresAdminEditPassword'] -and $existing.PostgresAdminEditPassword) { $adminEditPassword = $existing.PostgresAdminEditPassword.ToString() }
+    if (-not $adminEditPassword) { $adminEditPassword = New-RandomToken }
+
+    foreach ($pair in @(@('API token',$apiToken), @('PostgreSQL application password',$appPassword), @('PostgreSQL administrator password',$adminPassword), @('PostgreSQL admin read password',$adminReadPassword), @('PostgreSQL admin edit password',$adminEditPassword))) {
         if ($pair[1].Length -lt 32 -or $pair[1].Length -gt 256) { throw "$($pair[0]) must contain 32 to 256 characters." }
     }
     $document = [pscustomobject][ordered]@{
-        Version = 2
+        Version = 3
         ApiToken = $apiToken
         PostgresAppPassword = $appPassword
         PostgresAdminPassword = $adminPassword
         PostgresAdminReadPassword = $adminReadPassword
+        PostgresAdminEditPassword = $adminEditPassword
     }
     Write-JsonAtomic -Path $installedSecrets -Document $document -Depth 10
     Protect-SensitiveFile -Path $installedSecrets
@@ -522,6 +540,25 @@ function Invoke-Psql {
         $output = & $postgresPsql @psqlArguments 2>&1
         $exit = $LASTEXITCODE
         if ($exit -ne 0) { throw "psql failed with exit code $exit`: $($output -join [Environment]::NewLine)" }
+        return @($output)
+    } finally {
+        [Environment]::SetEnvironmentVariable('PGPASSWORD',$old,'Process')
+    }
+}
+
+function Invoke-PostgresTool {
+    param(
+        [string]$Tool,
+        [string[]]$Arguments,
+        [string]$Password
+    )
+    if (-not (Test-Path -LiteralPath $Tool -PathType Leaf)) { throw "PostgreSQL tool is missing: $Tool" }
+    $old = [Environment]::GetEnvironmentVariable('PGPASSWORD','Process')
+    [Environment]::SetEnvironmentVariable('PGPASSWORD',$Password,'Process')
+    try {
+        $output = & $Tool @Arguments 2>&1
+        $exit = $LASTEXITCODE
+        if ($exit -ne 0) { throw "$([IO.Path]::GetFileName($Tool)) failed with exit code $exit`: $($output -join [Environment]::NewLine)" }
         return @($output)
     } finally {
         [Environment]::SetEnvironmentVariable('PGPASSWORD',$old,'Process')
@@ -697,6 +734,42 @@ function Ensure-PostgreSQLInstalled {
     if ($clippySchemaExists -eq '1') {
         Invoke-Psql -Database $dbName -Sql "GRANT USAGE ON SCHEMA clippy TO $adminReadRole; GRANT SELECT ON ALL TABLES IN SCHEMA clippy TO $adminReadRole; ALTER DEFAULT PRIVILEGES FOR ROLE $appRole IN SCHEMA clippy GRANT SELECT ON TABLES TO $adminReadRole;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
     }
+
+    Assert-SafePostgresName -Value $adminEditRole -Label 'Admin edit PostgreSQL role' | Out-Null
+    $adminEditPassword = $secrets.PostgresAdminEditPassword.ToString()
+    if ($adminEditPassword -notmatch '^[0-9a-f]{64}$') { throw 'Generated PostgreSQL admin edit password is not in its expected safe format.' }
+    $adminEditRoleExists = ((Invoke-Psql -Sql "SELECT 1 FROM pg_roles WHERE rolname='$adminEditRole';" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+    if ($adminEditRoleExists -ne '1') {
+        Invoke-Psql -Sql "SET password_encryption='scram-sha-256'; CREATE ROLE $adminEditRole LOGIN PASSWORD '$adminEditPassword' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION CONNECTION LIMIT 4;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    } else {
+        Invoke-Psql -Sql "SET password_encryption='scram-sha-256'; ALTER ROLE $adminEditRole PASSWORD '$adminEditPassword'; ALTER ROLE $adminEditRole NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION CONNECTION LIMIT 4;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    }
+    Invoke-Psql -Sql "ALTER ROLE $adminEditRole RESET default_transaction_read_only; ALTER ROLE $adminEditRole SET search_path TO clippy, pg_catalog;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    Invoke-Psql -Sql "REVOKE ALL ON DATABASE $dbName FROM $adminEditRole; GRANT CONNECT ON DATABASE $dbName TO $adminEditRole;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+    if ($clippySchemaExists -eq '1') {
+        Invoke-Psql -Database $dbName -Sql "GRANT USAGE ON SCHEMA clippy TO $adminEditRole; GRANT SELECT ON ALL TABLES IN SCHEMA clippy TO $adminEditRole;" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+        $adminEditTablesReady = ((Invoke-Psql -Database $dbName -Sql "SELECT CASE WHEN to_regclass('clippy.admin_container_locks') IS NOT NULL AND to_regclass('clippy.admin_change_sets') IS NOT NULL AND to_regclass('clippy.admin_change_entries') IS NOT NULL AND to_regclass('clippy.admin_quarantine') IS NOT NULL AND to_regclass('clippy.admin_storage_snapshots') IS NOT NULL AND to_regclass('clippy.admin_snapshot_roots') IS NOT NULL AND to_regclass('clippy.admin_audit_events') IS NOT NULL THEN 1 ELSE 0 END;" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+        if ($adminEditTablesReady -eq '1') {
+            $editSql = @"
+GRANT UPDATE(revision,updated_ms) ON clippy.storage_containers TO $adminEditRole;
+GRANT INSERT,UPDATE,DELETE ON clippy.cargo_roots TO $adminEditRole;
+GRANT INSERT,DELETE ON clippy.cargo_item_index TO $adminEditRole;
+GRANT INSERT,DELETE ON clippy.admin_container_locks TO $adminEditRole;
+GRANT INSERT ON clippy.admin_change_sets TO $adminEditRole;
+GRANT UPDATE(status,undone_ms,undo_change_id) ON clippy.admin_change_sets TO $adminEditRole;
+GRANT INSERT ON clippy.admin_change_entries TO $adminEditRole;
+GRANT INSERT ON clippy.admin_quarantine TO $adminEditRole;
+GRANT UPDATE(restored_change_id,restored_ms) ON clippy.admin_quarantine TO $adminEditRole;
+GRANT INSERT ON clippy.admin_storage_snapshots TO $adminEditRole;
+GRANT INSERT ON clippy.admin_snapshot_roots TO $adminEditRole;
+GRANT INSERT ON clippy.admin_audit_events TO $adminEditRole;
+GRANT INSERT ON clippy.admin_player_commands TO $adminEditRole;
+GRANT USAGE,SELECT ON SEQUENCE clippy.admin_change_entries_entry_id_seq TO $adminEditRole;
+GRANT USAGE,SELECT ON SEQUENCE clippy.admin_audit_events_event_id_seq TO $adminEditRole;
+"@
+            Invoke-Psql -Database $dbName -Sql $editSql -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+        }
+    }
     Write-Host "PostgreSQL ready on 127.0.0.1:$postgresPort using service $postgresServiceName." -ForegroundColor Green
 }
 
@@ -708,7 +781,7 @@ function Get-PayloadHostExecutable {
         throw 'Prebuilt ClippyStorageHost.exe is unexpectedly small.'
     }
     $manifestPath = Join-Path $payloadRoot 'PAYLOAD-MANIFEST.json'
-    $expectedVersion = '0.5.1'
+    $expectedVersion = '1.0.0'
     if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
         $manifest = Read-JsonFile -Path $manifestPath
         $expectedHash = $manifest.HostExeSHA256.ToString().Trim().ToUpperInvariant()
@@ -716,7 +789,7 @@ function Get-PayloadHostExecutable {
         if ((Get-FileHash -LiteralPath $payloadHostExe -Algorithm SHA256).Hash -ne $expectedHash) {
             throw 'Prebuilt ClippyStorageHost.exe hash does not match the release manifest.'
         }
-        $expectedVersion = $manifest.Version.ToString()
+        $expectedVersion = if ($manifest.PSObject.Properties['HostVersion']) { $manifest.HostVersion.ToString() } else { $manifest.Version.ToString() }
     }
     $help = & $payloadHostExe '--help' 2>&1
     $exitCode = $LASTEXITCODE
@@ -742,7 +815,7 @@ function Get-PayloadAdminExecutable {
     if ((Get-FileHash -LiteralPath $payloadAdminExe -Algorithm SHA256).Hash -ne $expectedHash) {
         throw 'Prebuilt ClippyAdminHost.exe hash does not match the release manifest.'
     }
-    $expectedVersion = if ($manifest.PSObject.Properties['AdminVersion']) { $manifest.AdminVersion.ToString() } else { '0.5.1-alpha.1' }
+    $expectedVersion = if ($manifest.PSObject.Properties['AdminVersion']) { $manifest.AdminVersion.ToString() } else { $manifest.Version.ToString() }
     $help = & $payloadAdminExe '--help' 2>&1
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0 -or (($help | Out-String) -notmatch [regex]::Escape("ClippyAdminHost $expectedVersion"))) {
@@ -824,9 +897,13 @@ function Assert-StagedPayloadIntegrity {
     $manifest = Read-JsonFile -Path $manifestPath
     $releaseVersion = $manifest.Version.ToString()
     $workshopVersion = if ($manifest.PSObject.Properties['WorkshopVersion']) { $manifest.WorkshopVersion.ToString() } else { $releaseVersion }
+    $hostComponentVersion = if ($manifest.PSObject.Properties['HostVersion']) { $manifest.HostVersion.ToString() } else { $releaseVersion }
+    $adminComponentVersion = if ($manifest.PSObject.Properties['AdminVersion']) { $manifest.AdminVersion.ToString() } else { $releaseVersion }
     if ($manifest.WorkshopID.ToString() -ne $workshopId -or
         $releaseVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
-        $workshopVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw 'Staged payload identity is invalid.' }
+        $workshopVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
+        $hostComponentVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
+        $adminComponentVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw 'Staged payload identity is invalid.' }
     $signatureFile = $manifest.SignatureFile.ToString()
     $keyFile = $manifest.KeyFile.ToString()
     if ($signatureFile -notmatch '^[A-Za-z0-9_.-]+\.bisign$' -or $keyFile -notmatch '^[A-Za-z0-9_.-]+\.bikey$') { throw 'Staged payload signature or public-key filename is invalid.' }
@@ -908,8 +985,18 @@ function Assert-Configuration {
     if ($adminPort -eq $port -or $adminPort -eq $postgresPort) { throw 'AdminPanel.Port must be different from the storage host and PostgreSQL ports.' }
     if ([int]$config.AdminPanel.PostgresPoolSize -lt 2 -or [int]$config.AdminPanel.PostgresPoolSize -gt 12) { throw 'AdminPanel.PostgresPoolSize must be between 2 and 12.' }
     if ([int]$config.AdminPanel.HttpThreads -lt 2 -or [int]$config.AdminPanel.HttpThreads -gt 32) { throw 'AdminPanel.HttpThreads must be between 2 and 32.' }
-    if ([bool]$config.AdminPanel.EnableEditing) { Write-Warning 'AdminPanel.EnableEditing is ignored in the read-only alpha. No write API is compiled into ClippyAdminHost.' }
-    if ([int]$config.ConfigVersion -ne 5) { throw 'Unsupported ClippyServerManager.json ConfigVersion.' }
+    if ([int]$config.AdminPanel.MaintenanceLockSeconds -lt 30 -or [int]$config.AdminPanel.MaintenanceLockSeconds -gt 900) { throw 'AdminPanel.MaintenanceLockSeconds must be between 30 and 900.' }
+    if ([int]$config.AdminPanel.PostgresWritePoolSize -lt 1 -or [int]$config.AdminPanel.PostgresWritePoolSize -gt 4) { throw 'AdminPanel.PostgresWritePoolSize must be between 1 and 4.' }
+    if ([int]$config.AdminPanel.PostgresWriteStatementTimeoutMs -lt 500 -or [int]$config.AdminPanel.PostgresWriteStatementTimeoutMs -gt 15000) { throw 'AdminPanel.PostgresWriteStatementTimeoutMs must be between 500 and 15000.' }
+    if ([int]$config.AdminPanel.PostgresWriteLockTimeoutMs -lt 100 -or [int]$config.AdminPanel.PostgresWriteLockTimeoutMs -gt 5000) { throw 'AdminPanel.PostgresWriteLockTimeoutMs must be between 100 and 5000.' }
+    if ([int]$config.AdminPanel.PlayerSnapshotIntervalSeconds -lt 30 -or [int]$config.AdminPanel.PlayerSnapshotIntervalSeconds -gt 3600) { throw 'AdminPanel.PlayerSnapshotIntervalSeconds must be between 30 and 3600.' }
+    if ([int]$config.AdminPanel.PlayerCommandPollIntervalSeconds -lt 1 -or [int]$config.AdminPanel.PlayerCommandPollIntervalSeconds -gt 30) { throw 'AdminPanel.PlayerCommandPollIntervalSeconds must be between 1 and 30.' }
+    if ([int]$config.AdminPanel.PlayerCommandExpirySeconds -lt 5 -or [int]$config.AdminPanel.PlayerCommandExpirySeconds -gt 300) { throw 'AdminPanel.PlayerCommandExpirySeconds must be between 5 and 300.' }
+    if ([int]$config.AdminPanel.PlayerTelemetryRetentionDays -lt 1 -or [int]$config.AdminPanel.PlayerTelemetryRetentionDays -gt 3650) { throw 'AdminPanel.PlayerTelemetryRetentionDays must be between 1 and 3650.' }
+    if ([int]$config.AdminPanel.PlayerSnapshotHistoryLimit -lt 2 -or [int]$config.AdminPanel.PlayerSnapshotHistoryLimit -gt 10000) { throw 'AdminPanel.PlayerSnapshotHistoryLimit must be between 2 and 10000.' }
+    if ([int]$config.AdminPanel.AdminAuditRetentionDays -lt 7 -or [int]$config.AdminPanel.AdminAuditRetentionDays -gt 3650) { throw 'AdminPanel.AdminAuditRetentionDays must be between 7 and 3650.' }
+    if ([bool]$config.AdminPanel.EnableLivePlayerControl -and -not [bool]$config.AdminPanel.EnablePlayerTelemetry) { throw 'AdminPanel.EnableLivePlayerControl requires EnablePlayerTelemetry.' }
+    if ([int]$config.ConfigVersion -ne 6) { throw 'Unsupported ClippyServerManager.json ConfigVersion.' }
 }
 
 
@@ -1101,6 +1188,9 @@ function New-DesiredHostDocument {
         maxQueuedRequests = [int]$config.StorageHostSettings.MaxQueuedRequests
         maxBackupFiles = [int]$config.StorageHostSettings.MaxBackupFiles
         terminalRetentionDays = [int]$config.StorageHostSettings.TerminalRetentionDays
+        playerTelemetryRetentionDays = [int]$config.AdminPanel.PlayerTelemetryRetentionDays
+        playerSnapshotHistoryLimit = [int]$config.AdminPanel.PlayerSnapshotHistoryLimit
+        adminAuditRetentionDays = [int]$config.AdminPanel.AdminAuditRetentionDays
         maintenancePruneBatchRows = [int]$config.StorageHostSettings.MaintenancePruneBatchRows
         maintenanceIntervalSeconds = [int]$config.StorageHostSettings.MaintenanceIntervalSeconds
         maxRequestBytes = [int]$config.StorageHostSettings.MaxRequestBytes
@@ -1122,6 +1212,12 @@ function New-DesiredAdminDocument {
         maxRequestBytes = [int]$config.AdminPanel.MaxRequestBytes
         storageHostAddress = '127.0.0.1'
         storageHostPort = [int]$config.StorageHostSettings.Port
+        storageHostApiToken = $secrets.ApiToken.ToString()
+        dayzExecutableName = [IO.Path]::GetFileName($config.ServerExecutable.ToString())
+        backupDirectory = (Resolve-AbsolutePath -Value $config.StorageHostSettings.BackupDirectory.ToString() -Base $installedHost)
+        exportDirectory = (Join-Path $installedAdmin 'exports')
+        enableEditing = ([bool]$config.AdminPanel.EnableEditing -and [bool]$script:adminEditingAvailable)
+        maintenanceLockSeconds = [int]$config.AdminPanel.MaintenanceLockSeconds
         postgresHost = '127.0.0.1'
         postgresPort = [int]$config.PostgreSQL.Port
         postgresDatabase = $config.StorageHostSettings.PostgresDatabase.ToString()
@@ -1134,6 +1230,20 @@ function New-DesiredAdminDocument {
         postgresStatementTimeoutMs = [int]$config.AdminPanel.PostgresStatementTimeoutMs
         postgresLockTimeoutMs = [int]$config.AdminPanel.PostgresLockTimeoutMs
         postgresIdleTransactionTimeoutMs = [int]$config.AdminPanel.PostgresIdleTransactionTimeoutMs
+        postgresWriteUser = $adminEditRole
+        postgresWritePassword = $secrets.PostgresAdminEditPassword.ToString()
+        postgresWritePoolSize = [int]$config.AdminPanel.PostgresWritePoolSize
+        postgresWriteStatementTimeoutMs = [int]$config.AdminPanel.PostgresWriteStatementTimeoutMs
+        postgresWriteLockTimeoutMs = [int]$config.AdminPanel.PostgresWriteLockTimeoutMs
+        enablePlayerTelemetry = [bool]$config.AdminPanel.EnablePlayerTelemetry
+        enablePlayerNetworkTelemetry = [bool]$config.AdminPanel.EnablePlayerNetworkTelemetry
+        enablePlayerPositionTelemetry = [bool]$config.AdminPanel.EnablePlayerPositionTelemetry
+        playerSnapshotIntervalSeconds = [int]$config.AdminPanel.PlayerSnapshotIntervalSeconds
+        playerTelemetryRetentionDays = [int]$config.AdminPanel.PlayerTelemetryRetentionDays
+        playerSnapshotHistoryLimit = [int]$config.AdminPanel.PlayerSnapshotHistoryLimit
+        adminAuditRetentionDays = [int]$config.AdminPanel.AdminAuditRetentionDays
+        enableLivePlayerControl = [bool]$config.AdminPanel.EnableLivePlayerControl
+        playerCommandExpirySeconds = [int]$config.AdminPanel.PlayerCommandExpirySeconds
     }
 }
 
@@ -1191,6 +1301,13 @@ function Sync-InstalledConfiguration {
     $dayZSettings | Add-Member -NotePropertyName ProviderID -NotePropertyValue $script:managerState.EffectiveProviderID -Force
     $requiresExistingMigration = [bool]$script:managerState.RequiresExistingCargoMigration
     $dayZSettings | Add-Member -NotePropertyName EnableExistingCargoMigration -NotePropertyValue $requiresExistingMigration -Force
+    $dayZSettings | Add-Member -NotePropertyName EnablePlayerTelemetry -NotePropertyValue ([bool]$config.AdminPanel.EnablePlayerTelemetry) -Force
+    $dayZSettings | Add-Member -NotePropertyName EnablePlayerNetworkTelemetry -NotePropertyValue ([bool]$config.AdminPanel.EnablePlayerNetworkTelemetry) -Force
+    $dayZSettings | Add-Member -NotePropertyName EnablePlayerPositionTelemetry -NotePropertyValue ([bool]$config.AdminPanel.EnablePlayerPositionTelemetry) -Force
+    $dayZSettings | Add-Member -NotePropertyName PlayerSnapshotIntervalSeconds -NotePropertyValue ([int]$config.AdminPanel.PlayerSnapshotIntervalSeconds) -Force
+    $dayZSettings | Add-Member -NotePropertyName EnableLivePlayerControl -NotePropertyValue ([bool]$config.AdminPanel.EnableLivePlayerControl) -Force
+    $dayZSettings | Add-Member -NotePropertyName PlayerCommandPollIntervalSeconds -NotePropertyValue ([int]$config.AdminPanel.PlayerCommandPollIntervalSeconds) -Force
+    $dayZSettings | Add-Member -NotePropertyName PlayerCommandExpirySeconds -NotePropertyValue ([int]$config.AdminPanel.PlayerCommandExpirySeconds) -Force
     # Legacy compatibility fields are written only when an old compatibility PBO is detected.
     if (Test-CompatibilityPboInUse) {
         $legacyMode = if ($requiresExistingMigration) { 'ImportAndRemove' } else { 'Off' }
@@ -1228,7 +1345,7 @@ function Install-Payload {
     Ensure-PostgreSQLInstalled
 
     if (Test-InstalledCurrentWorkshopMod) {
-        Write-Host 'Detected an installed 0.5.0 Workshop PBO. Preserving it instead of replacing it with the signed compatibility fallback.' -ForegroundColor Green
+        Write-Host 'Detected an installed Clippy Workshop PBO. Preserving it instead of replacing it with a compatibility fallback.' -ForegroundColor Green
     } else {
         Copy-DirectoryAtomic -Source $payloadMod -Target $installedMod
     }
@@ -1780,6 +1897,18 @@ function Test-ClippySchemaReady {
     } catch { return $false }
 }
 
+function Test-ClippyEditSchemaReady {
+    try {
+        $database = $config.StorageHostSettings.PostgresDatabase.ToString()
+        $secrets = Get-OrCreateSecrets
+        $versionText = ((Invoke-Psql -Database $database -Sql "SELECT COALESCE(max(version),0) FROM clippy.schema_migrations;" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+        $version = 0
+        if (-not [int]::TryParse($versionText, [ref]$version) -or $version -lt 9) { return $false }
+        $tables = ((Invoke-Psql -Database $database -Sql "SELECT CASE WHEN to_regclass('clippy.admin_container_locks') IS NOT NULL AND to_regclass('clippy.admin_change_sets') IS NOT NULL AND to_regclass('clippy.admin_quarantine') IS NOT NULL AND to_regclass('clippy.admin_storage_snapshots') IS NOT NULL AND to_regclass('clippy.admin_audit_events') IS NOT NULL THEN 1 ELSE 0 END;" -Password $secrets.PostgresAdminPassword.ToString() -TuplesOnly) -join '').Trim()
+        return $tables -eq '1'
+    } catch { return $false }
+}
+
 function Test-ItemIndexComplete {
     try {
         $database = $config.StorageHostSettings.PostgresDatabase.ToString()
@@ -1940,6 +2069,35 @@ function Start-ClippyAdminPanel {
         }
     }
 
+    $script:adminEditingAvailable = $false
+    if (-not [bool]$config.AdminPanel.EnableEditing) {
+        Write-Warning 'AdminPanel.EnableEditing is false in the existing ClippyServerManager.json. The panel will open read-only. Set it to true when you are ready to use maintenance-lock editing.'
+    }
+    if ([bool]$config.AdminPanel.EnableEditing) {
+        $editSchemaReady = Test-ClippyEditSchemaReady
+        if (-not $editSchemaReady) {
+            if ($dayZ) {
+                Write-Warning 'Admin editing requires PostgreSQL schema version 11 and the matching 1.0.0 StorageHost. The panel will open read-only until the server is stopped once and the payload is updated.'
+            } elseif ($storageRuntimeCurrent) {
+                $hostProcess = Get-InstalledHostProcess
+                if (-not $hostProcess) {
+                    Start-InstalledHost | Out-Null
+                    $startedHostForMaintenance = $true
+                } else {
+                    $document = Read-JsonFile -Path $installedHostConfig
+                    Wait-HostHealthy -HostDocument $document | Out-Null
+                }
+                if (-not (Test-ClippyEditSchemaReady)) { throw 'Clippy PostgreSQL schema did not migrate to version 9 required for safe admin editing.' }
+                Ensure-PostgreSQLInstalled
+                $editSchemaReady = $true
+            }
+        }
+        if ($editSchemaReady -and $storageRuntimeCurrent) {
+            Ensure-PostgreSQLInstalled
+            $script:adminEditingAvailable = $true
+        }
+    }
+
     if ($startedHostForMaintenance -and -not $dayZ) {
         Stop-InstalledHost -AllowForce
     }
@@ -1981,7 +2139,11 @@ function Start-ClippyAdminPanel {
         Start-Process $url | Out-Null
     }
     Write-Host "Clippy Admin Panel started on 127.0.0.1:$([int]$config.AdminPanel.Port), PID $($process.Id)." -ForegroundColor Green
-    Write-Host 'Admin Panel Alpha is read-only. PostgreSQL remains private on loopback.' -ForegroundColor Green
+    if ($script:adminEditingAvailable) {
+        Write-Host 'Admin editing is enabled with maintenance locks, revision checks, audit history, and undo. PostgreSQL remains private on loopback.' -ForegroundColor Green
+    } else {
+        Write-Host 'Admin Panel is running read-only. PostgreSQL remains private on loopback.' -ForegroundColor Green
+    }
 }
 
 function Invoke-IntegrityCheck {
@@ -2061,6 +2223,108 @@ function Invoke-OnlineBackup {
     if (-not $result.ok) { throw 'PostgreSQL online backup failed.' }
     Write-Host "PostgreSQL backup: $($result.data.path)" -ForegroundColor Green
     return $result
+}
+
+function Invoke-PostgresBackupRestore {
+    param([string]$BackupFile)
+
+    Assert-Configuration
+    if (Get-DayZProcess) { throw 'Refusing to restore PostgreSQL while DayZ is running. Stop DayZ first.' }
+    if (-not $BackupFile) { throw 'Specify a Clippy backup filename, for example: ClippyServerManager.ps1 restore-backup ClippyVirtualCargo-1234567890123-89abcdef.dump' }
+    $backupName = [IO.Path]::GetFileName($BackupFile.Trim())
+    if ($backupName -ne $BackupFile.Trim() -or $backupName -notmatch '^ClippyVirtualCargo-[0-9]{10,20}-[0-9a-fA-F]{8}\.dump$') {
+        throw 'Restore accepts only a Clippy-generated backup filename from the configured backup directory.'
+    }
+
+    Ensure-PostgreSQLInstalled
+    $secrets = Get-OrCreateSecrets
+    $dbName = Assert-SafePostgresName -Value $config.StorageHostSettings.PostgresDatabase.ToString() -Label 'PostgresDatabase'
+    $appRole = Assert-SafePostgresName -Value $config.StorageHostSettings.PostgresUser.ToString() -Label 'PostgresUser'
+    $backupRoot = Resolve-InstalledHostPath -Value $config.StorageHostSettings.BackupDirectory.ToString()
+    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    $backupPath = Assert-UnderRoot -Path (Join-Path $backupRoot $backupName) -Root $backupRoot
+    if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf) -or (Get-Item -LiteralPath $backupPath).Length -le 0) {
+        throw "Restore backup is missing or empty: $backupPath"
+    }
+
+    $pgDump = Join-Path $postgresBin 'pg_dump.exe'
+    $pgRestore = Join-Path $postgresBin 'pg_restore.exe'
+    $connectionArgs = @('--host','127.0.0.1','--port',$postgresPort.ToString())
+    Invoke-PostgresTool -Tool $pgRestore -Arguments @('--list',$backupPath) -Password $secrets.PostgresAppPassword.ToString() | Out-Null
+
+    $targetHash = (Get-FileHash -LiteralPath $backupPath -Algorithm SHA256).Hash
+    Write-Host ''
+    Write-Host 'DANGER: PostgreSQL restore will replace the current Clippy virtual-cargo database.' -ForegroundColor Red
+    Write-Host "Target backup: $backupName" -ForegroundColor Yellow
+    Write-Host "Target SHA256: $targetHash" -ForegroundColor DarkGray
+    Write-Host 'DayZ must remain stopped until this command finishes.' -ForegroundColor Yellow
+    $confirmation = Read-Host "Type RESTORE $backupName to continue"
+    if ($confirmation -cne "RESTORE $backupName") { throw 'Restore cancelled because the confirmation text did not match exactly.' }
+
+    if (Get-InstalledAdminProcess) {
+        Write-Host 'Stopping Clippy Admin Panel for database maintenance...' -ForegroundColor Cyan
+        Stop-InstalledAdmin
+    }
+    if (Get-InstalledHostProcess) {
+        Write-Host 'Stopping ClippyStorageHost for database maintenance...' -ForegroundColor Cyan
+        Stop-InstalledHost -AllowForce
+    }
+    if (Get-DayZProcess) { throw 'DayZ started while restore preparation was running. Restore cancelled.' }
+
+    $createdMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $randomSuffix = (New-RandomToken).Substring(0,8)
+    $safetyName = "ClippyVirtualCargo-$createdMs-$randomSuffix.dump"
+    $safetyPath = Assert-UnderRoot -Path (Join-Path $backupRoot $safetyName) -Root $backupRoot
+    $journalPath = Assert-UnderRoot -Path (Join-Path $backupRoot ("restore-$createdMs-$randomSuffix.txt")) -Root $backupRoot
+
+    Write-Host "Creating fresh pre-restore safety backup: $safetyName" -ForegroundColor Cyan
+    $dumpArgs = $connectionArgs + @('--username',$appRole,'--dbname',$dbName,'--format=custom','--compress=6','--no-owner','--no-privileges','--file',$safetyPath)
+    Invoke-PostgresTool -Tool $pgDump -Arguments $dumpArgs -Password $secrets.PostgresAppPassword.ToString() | Out-Null
+    if (-not (Test-Path -LiteralPath $safetyPath -PathType Leaf) -or (Get-Item -LiteralPath $safetyPath).Length -le 0) { throw 'The pre-restore safety backup was not created.' }
+    Invoke-PostgresTool -Tool $pgRestore -Arguments @('--list',$safetyPath) -Password $secrets.PostgresAppPassword.ToString() | Out-Null
+    $safetyHash = (Get-FileHash -LiteralPath $safetyPath -Algorithm SHA256).Hash
+
+    $journal = @"
+Clippy Virtual Cargo PostgreSQL restore
+Started UTC: $([DateTime]::UtcNow.ToString('o'))
+Target: $backupName
+Target SHA256: $targetHash
+Safety backup: $safetyName
+Safety SHA256: $safetyHash
+Database: $dbName
+Result: STARTED
+"@
+    Write-TextAtomic -Path $journalPath -Text $journal
+
+    try {
+        Invoke-Psql -Sql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$dbName' AND pid<>pg_backend_pid();" -Password $secrets.PostgresAdminPassword.ToString() | Out-Null
+        if ((Get-DayZProcess) -or (Get-InstalledHostProcess) -or (Get-InstalledAdminProcess)) { throw 'A Clippy/DayZ process restarted during restore preparation. Restore cancelled.' }
+
+        Write-Host 'Restoring PostgreSQL backup...' -ForegroundColor Cyan
+        $restoreArgs = $connectionArgs + @('--username',$appRole,'--dbname',$dbName,'--clean','--if-exists','--no-owner','--no-privileges','--exit-on-error',$backupPath)
+        Invoke-PostgresTool -Tool $pgRestore -Arguments $restoreArgs -Password $secrets.PostgresAppPassword.ToString() | Out-Null
+
+        # Reapply restricted service/admin role grants that are intentionally omitted from portable pg_dump archives.
+        Ensure-PostgreSQLInstalled
+
+        if (-not (Test-Path -LiteralPath $installedHostExe -PathType Leaf)) { throw 'Restore completed, but ClippyStorageHost.exe is missing so post-restore validation could not run.' }
+        Write-Host 'Starting StorageHost temporarily for schema migration and integrity validation...' -ForegroundColor Cyan
+        Start-InstalledHost | Out-Null
+        Invoke-IntegrityCheck | Out-Null
+        Stop-InstalledHost -AllowForce
+
+        $finished = $journal.Replace('Result: STARTED','Result: SUCCESS') + "Finished UTC: $([DateTime]::UtcNow.ToString('o'))`r`n"
+        Write-TextAtomic -Path $journalPath -Text $finished
+        Write-Host "Restore completed and passed the Clippy integrity check. Safety backup: $safetyPath" -ForegroundColor Green
+        Write-Host 'StorageHost and DayZ were left stopped. Start the server normally when ready.' -ForegroundColor Green
+    } catch {
+        try {
+            if (Get-InstalledHostProcess) { Stop-InstalledHost -AllowForce }
+        } catch { }
+        $failed = $journal.Replace('Result: STARTED','Result: FAILED') + "Failed UTC: $([DateTime]::UtcNow.ToString('o'))`r`nError: $($_.Exception.Message)`r`n"
+        Write-TextAtomic -Path $journalPath -Text $failed
+        throw "PostgreSQL restore failed. The fresh safety backup is $safetyPath. Details were written to $journalPath. $($_.Exception.Message)"
+    }
 }
 
 function Show-Status {
@@ -2167,6 +2431,10 @@ switch ($command) {
         if (-not (Get-InstalledHostProcess)) { Start-InstalledHost | Out-Null }
         Invoke-OnlineBackup | Out-Null
     }
+    'restore-backup' {
+        $restoreFile = if ($Value) { $Value } elseif ($env:CLIPPY_RESTORE_FILE) { $env:CLIPPY_RESTORE_FILE } else { '' }
+        Invoke-PostgresBackupRestore -BackupFile $restoreFile
+    }
     'stop-host' {
         if (Get-DayZProcess) { throw 'Refusing to stop the storage host while DayZ is running.' }
         Stop-InstalledHost -AllowForce
@@ -2186,7 +2454,7 @@ switch ($command) {
         Write-Host "Generated arguments: $arguments"
     }
     'help' {
-        Write-Host 'Commands: start, install, admin, status, check, backup, stop-host, validate, help'
+        Write-Host 'Commands: start, install, admin, status, check, backup, restore-backup, stop-host, validate, help'
         Write-Host 'Edit ClippyServerManager.json to change server, port, database, launch, persistence, and backup settings.'
     }
     default { throw "Unknown manager command '$command'. Use help for the command list." }

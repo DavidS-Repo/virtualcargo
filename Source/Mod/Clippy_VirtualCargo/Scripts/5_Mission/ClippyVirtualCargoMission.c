@@ -257,6 +257,412 @@ class CVCIncompleteMigrationHandler: CVCResponseHandler
     }
 }
 
+
+class CVCPlayerSnapshotHandler: CVCResponseHandler
+{
+    protected string m_PlayerID;
+
+    void CVCPlayerSnapshotHandler(string playerID)
+    {
+        m_PlayerID = playerID;
+    }
+
+    override void OnSuccess(string raw) {}
+
+    override void OnFailure(string reason)
+    {
+        ErrorEx("[Clippy Virtual Cargo] Player telemetry snapshot failed for " + m_PlayerID + ": " + reason);
+    }
+}
+
+class CVCPlayerCommandCompleteHandler: CVCResponseHandler
+{
+    protected string m_CommandID;
+
+    void CVCPlayerCommandCompleteHandler(string commandID)
+    {
+        m_CommandID = commandID;
+    }
+
+    override void OnSuccess(string raw) {}
+
+    override void OnFailure(string reason)
+    {
+        ErrorEx("[Clippy Virtual Cargo] Live admin command result could not be recorded for " + m_CommandID + ": " + reason);
+    }
+}
+
+class CVCPlayerCommandPollHandler: CVCResponseHandler
+{
+    protected string m_PlayerID;
+
+    void CVCPlayerCommandPollHandler(string playerID)
+    {
+        m_PlayerID = playerID;
+    }
+
+    override void OnSuccess(string raw)
+    {
+        CVCPlayerCommandListEnvelope response = new CVCPlayerCommandListEnvelope;
+        JsonSerializer serializer = new JsonSerializer;
+        string parseError;
+        if (!serializer.ReadFromString(response, raw, parseError) || !response.ok || !response.data)
+        {
+            ErrorEx("[Clippy Virtual Cargo] Invalid player command response for " + m_PlayerID + ": " + parseError);
+            return;
+        }
+        if (!response.data.commands)
+            return;
+        foreach (CVCPlayerCommandData command : response.data.commands)
+        {
+            if (command)
+                CVCPlayerTelemetry.ExecuteCommand(m_PlayerID, command);
+        }
+    }
+
+    override void OnFailure(string reason)
+    {
+        ErrorEx("[Clippy Virtual Cargo] Live player command poll failed for " + m_PlayerID + ": " + reason);
+    }
+}
+
+class CVCPlayerTelemetry
+{
+    protected static ref map<string,int> s_LastSnapshot = new map<string,int>;
+    protected static ref map<string,int> s_LastCommandPoll = new map<string,int>;
+    protected static bool s_Started;
+
+    static void Start()
+    {
+        if (s_Started || !GetGame().IsServer())
+            return;
+        s_Started = true;
+        if (!CVCSettingsManager.Get().EnablePlayerTelemetry)
+        {
+            Print("[Clippy Virtual Cargo] Optional player telemetry is disabled.");
+            return;
+        }
+        Print("[Clippy Virtual Cargo] Optional player telemetry enabled.");
+        GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(Tick, 1000, true);
+    }
+
+    static PlayerBase FindPlayer(string playerID)
+    {
+        if (playerID == "")
+            return null;
+        ref array<Man> players = new array<Man>;
+        GetGame().GetPlayers(players);
+        foreach (Man man : players)
+        {
+            PlayerBase player = PlayerBase.Cast(man);
+            if (player && player.GetIdentity() && player.GetIdentity().GetId() == playerID)
+                return player;
+        }
+        return null;
+    }
+
+    static ItemBase FindLiveItem(PlayerBase player, string itemID)
+    {
+        if (!player || itemID == "")
+            return null;
+        ref array<EntityAI> entities = new array<EntityAI>;
+        player.GetInventory().EnumerateInventory(InventoryTraversalType.PREORDER, entities);
+        foreach (EntityAI entity : entities)
+        {
+            ItemBase item = ItemBase.Cast(entity);
+            if (item && item.CVCGetLiveItemID() == itemID)
+                return item;
+        }
+        return null;
+    }
+
+    static void BuildSnapshot(PlayerBase player, CVCPlayerSnapshotRequest request)
+    {
+        if (!player || !request || !player.GetIdentity())
+            return;
+        PlayerIdentity identity = player.GetIdentity();
+        request.player_id = identity.GetId();
+        request.display_name = identity.GetName();
+        request.profile.plain_name = identity.GetPlainName();
+        request.profile.full_name = identity.GetFullName();
+        request.profile.session_player_id = identity.GetPlayerId();
+
+        CVCSettings settings = CVCSettingsManager.Get();
+        if (settings.EnablePlayerNetworkTelemetry)
+        {
+            request.network.available = true;
+            request.network.ping_act_ms = Math.Max(identity.GetPingAct(), 0);
+            request.network.ping_min_ms = Math.Max(identity.GetPingMin(), 0);
+            request.network.ping_max_ms = Math.Max(identity.GetPingMax(), 0);
+            request.network.ping_avg_ms = Math.Max(identity.GetPingAvg(), 0);
+            request.network.bandwidth_min_kbps = Math.Max(identity.GetBandwidthMin(), 0);
+            request.network.bandwidth_max_kbps = Math.Max(identity.GetBandwidthMax(), 0);
+            request.network.bandwidth_avg_kbps = Math.Max(identity.GetBandwidthAvg(), 0);
+            request.network.output_throttle = Math.Clamp(identity.GetOutputThrottle(), 0.0, 1.0);
+        }
+
+        if (settings.EnablePlayerPositionTelemetry)
+        {
+            vector playerPosition = player.GetPosition();
+            request.position.available = true;
+            request.position.map_name = GetGame().GetWorldName();
+            request.position.world_position_x = playerPosition[0];
+            request.position.world_position_y = playerPosition[1];
+            request.position.world_position_z = playerPosition[2];
+        }
+
+        ref array<EntityAI> entities = new array<EntityAI>;
+        player.GetInventory().EnumerateInventory(InventoryTraversalType.PREORDER, entities);
+        foreach (EntityAI entity : entities)
+        {
+            ItemBase item = ItemBase.Cast(entity);
+            if (!item || item.GetHierarchyParent() != player)
+                continue;
+            CVCItemNode node = CVCItemTreeCodec.CaptureLive(item);
+            if (node)
+                request.inventory.Insert(node);
+        }
+
+        EntityAI hands = player.GetItemInHands();
+        if (hands)
+            request.equipment.Set("hands", hands.GetType());
+        request.equipment.Set("root_items", request.inventory.Count().ToString());
+    }
+
+    static void SnapshotPlayer(PlayerBase player)
+    {
+        if (!player || !player.GetIdentity() || !CVCSettingsManager.Get().EnablePlayerTelemetry)
+            return;
+        CVCPlayerSnapshotRequest request = new CVCPlayerSnapshotRequest;
+        BuildSnapshot(player, request);
+        if (request.player_id == "")
+            return;
+        ClippyVirtualCargoAPI.Post("/v1/player/snapshot", request, new CVCPlayerSnapshotHandler(request.player_id));
+        s_LastSnapshot.Set(request.player_id, GetGame().GetTime());
+    }
+
+    static void PollCommands(PlayerBase player)
+    {
+        if (!player || !player.GetIdentity() || !CVCSettingsManager.Get().EnableLivePlayerControl)
+            return;
+        CVCPlayerCommandPollRequest request = new CVCPlayerCommandPollRequest;
+        request.player_id = player.GetIdentity().GetId();
+        request.limit = 4;
+        if (ClippyVirtualCargoAPI.Post("/v1/player/commands/poll", request, new CVCPlayerCommandPollHandler(request.player_id)))
+            s_LastCommandPoll.Set(request.player_id, GetGame().GetTime());
+    }
+
+    static void Complete(string playerID, string commandID, bool success, CVCPlayerCommandResult result, string error)
+    {
+        CVCPlayerCommandCompleteRequest request = new CVCPlayerCommandCompleteRequest;
+        request.player_id = playerID;
+        request.command_id = commandID;
+        if (success)
+            request.status = "SUCCEEDED";
+        else
+            request.status = "FAILED";
+        request.error = error;
+        if (result)
+        {
+            JsonSerializer serializer = new JsonSerializer;
+            string resultJson;
+            if (serializer.WriteToString(result, false, resultJson))
+                request.result_json = resultJson;
+        }
+        ClippyVirtualCargoAPI.Post("/v1/player/commands/complete", request, new CVCPlayerCommandCompleteHandler(commandID));
+    }
+
+    static bool ParsePayload(CVCPlayerCommandData command, out CVCPlayerCommandPayload payload, out string error)
+    {
+        payload = new CVCPlayerCommandPayload;
+        if (!command)
+        {
+            error = "command is missing";
+            return false;
+        }
+        if (command.payload_json == "")
+            return true;
+        JsonSerializer serializer = new JsonSerializer;
+        return serializer.ReadFromString(payload, command.payload_json, error);
+    }
+
+    static void ExecuteCommand(string playerID, CVCPlayerCommandData command)
+    {
+        PlayerBase player = FindPlayer(playerID);
+        if (!player)
+        {
+            Complete(playerID, command.command_id, false, null, "Player is no longer online.");
+            return;
+        }
+
+        CVCPlayerCommandPayload payload;
+        string parseError;
+        if (!ParsePayload(command, payload, parseError))
+        {
+            Complete(playerID, command.command_id, false, null, "Invalid command payload: " + parseError);
+            return;
+        }
+
+        CVCPlayerCommandResult result = new CVCPlayerCommandResult;
+        string failure;
+
+        if (command.action == "REQUEST_SNAPSHOT")
+        {
+            SnapshotPlayer(player);
+            Complete(playerID, command.command_id, true, result, "");
+            return;
+        }
+
+        if (command.action == "GIVE_ITEM")
+        {
+            if (!payload || payload.class_name == "")
+            {
+                Complete(playerID, command.command_id, false, null, "class_name is required.");
+                return;
+            }
+            ItemBase created = ItemBase.Cast(player.GetInventory().CreateInInventory(payload.class_name));
+            if (!created)
+            {
+                Complete(playerID, command.command_id, false, null, "DayZ could not place the requested item in the player inventory.");
+                return;
+            }
+            if (payload.quantity >= 0 && created.HasQuantity())
+                created.SetQuantity(payload.quantity);
+            created.SetHealth01("", "Health", Math.Clamp(payload.health, 0.0, 1.0));
+            result.created_item_id = created.CVCGetLiveItemID();
+            result.item_id = result.created_item_id;
+            SnapshotPlayer(player);
+            Complete(playerID, command.command_id, true, result, "");
+            return;
+        }
+
+        if (command.action == "RESTORE_QUARANTINE")
+        {
+            if (!payload || !payload.item_tree)
+            {
+                Complete(playerID, command.command_id, false, null, "The quarantine item tree is missing.");
+                return;
+            }
+            ItemBase restored = CVCItemTreeCodec.RestoreLiveRoot(payload.item_tree, player, failure);
+            if (!restored)
+            {
+                Complete(playerID, command.command_id, false, null, failure);
+                return;
+            }
+            result.item_id = restored.CVCGetLiveItemID();
+            result.quarantine_id = payload.quarantine_id;
+            SnapshotPlayer(player);
+            Complete(playerID, command.command_id, true, result, "");
+            return;
+        }
+
+        ItemBase item = FindLiveItem(player, payload.item_id);
+        if (!item)
+        {
+            Complete(playerID, command.command_id, false, null, "The requested live item is no longer in this player's inventory.");
+            return;
+        }
+        if (item.CVCGetVirtualItemID() != "")
+        {
+            Complete(playerID, command.command_id, false, null, "This item belongs to an active virtual-cargo materialization and cannot be changed by live player controls.");
+            return;
+        }
+
+        if (command.action == "REPAIR_ITEM")
+        {
+            item.SetHealth01("", "Health", Math.Clamp(payload.health, 0.0, 1.0));
+            result.item_id = item.CVCGetLiveItemID();
+            SnapshotPlayer(player);
+            Complete(playerID, command.command_id, true, result, "");
+            return;
+        }
+
+        if (command.action == "REMOVE_ITEM")
+        {
+            result.item_id = item.CVCGetLiveItemID();
+            item.DeleteSafe();
+            SnapshotPlayer(player);
+            Complete(playerID, command.command_id, true, result, "");
+            return;
+        }
+
+        if (command.action == "QUARANTINE_ITEM")
+        {
+            result.item_tree = CVCItemTreeCodec.CaptureLive(item);
+            if (!result.item_tree)
+            {
+                Complete(playerID, command.command_id, false, null, "The live item could not be serialized for quarantine.");
+                return;
+            }
+            result.item_id = result.item_tree.item_id;
+            item.DeleteSafe();
+            SnapshotPlayer(player);
+            Complete(playerID, command.command_id, true, result, "");
+            return;
+        }
+
+        if (command.action == "MOVE_ITEM")
+        {
+            PlayerBase target = FindPlayer(payload.target_player_id);
+            if (!target)
+            {
+                Complete(playerID, command.command_id, false, null, "The target player is not online.");
+                return;
+            }
+            CVCItemNode tree = CVCItemTreeCodec.CaptureLive(item);
+            if (!tree)
+            {
+                Complete(playerID, command.command_id, false, null, "The live item could not be serialized before moving it.");
+                return;
+            }
+            ItemBase moved = CVCItemTreeCodec.RestoreLiveRoot(tree, target, failure);
+            if (!moved)
+            {
+                Complete(playerID, command.command_id, false, null, failure);
+                return;
+            }
+            item.DeleteSafe();
+            result.item_id = moved.CVCGetLiveItemID();
+            result.target_player_id = payload.target_player_id;
+            SnapshotPlayer(player);
+            SnapshotPlayer(target);
+            Complete(playerID, command.command_id, true, result, "");
+            return;
+        }
+
+        Complete(playerID, command.command_id, false, null, "Unsupported live player command.");
+    }
+
+    static void Tick()
+    {
+        if (!GetGame().IsServer() || !CVCSettingsManager.Get().EnablePlayerTelemetry)
+            return;
+
+        int nowMs = GetGame().GetTime();
+        int snapshotInterval = Math.Clamp(CVCSettingsManager.Get().PlayerSnapshotIntervalSeconds, 30, 3600) * 1000;
+        int commandInterval = Math.Clamp(CVCSettingsManager.Get().PlayerCommandPollIntervalSeconds, 1, 60) * 1000;
+
+        ref array<Man> players = new array<Man>;
+        GetGame().GetPlayers(players);
+        foreach (Man man : players)
+        {
+            PlayerBase player = PlayerBase.Cast(man);
+            if (!player || !player.GetIdentity())
+                continue;
+            string playerID = player.GetIdentity().GetId();
+            int lastSnapshot;
+            if (!s_LastSnapshot.Find(playerID, lastSnapshot) || nowMs - lastSnapshot >= snapshotInterval)
+                SnapshotPlayer(player);
+            if (CVCSettingsManager.Get().EnableLivePlayerControl)
+            {
+                int lastPoll;
+                if (!s_LastCommandPoll.Find(playerID, lastPoll) || nowMs - lastPoll >= commandInterval)
+                    PollCommands(player);
+            }
+        }
+    }
+}
+
 modded class MissionServer
 {
     void MissionServer()
@@ -264,6 +670,7 @@ modded class MissionServer
         if (ClippyVirtualCargoAPI.InitializeServer())
         {
             CVCContainerService.EnableEnforcement();
+            CVCPlayerTelemetry.Start();
             Print("[Clippy Virtual Cargo] Physical cargo enforcement enabled before host recovery.");
             CVCStartupCoordinator.Check(1);
         }

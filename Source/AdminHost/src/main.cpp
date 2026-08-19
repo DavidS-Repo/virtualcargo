@@ -5,6 +5,7 @@
 #include "json.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -18,11 +19,18 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <tlhelp32.h>
+#include <shellapi.h>
+#endif
 
 namespace {
 
 using nlohmann::json;
-constexpr const char* admin_version = "0.5.1-alpha.1";
+constexpr const char* admin_version = "1.0.0";
 constexpr const char* cookie_name = "ClippyAdminSession";
 
 struct CliOptions {
@@ -159,6 +167,75 @@ std::string bounded_query_string(const httplib::Request& request, const char* ke
     return value;
 }
 
+json parse_body(const httplib::Request& request, std::size_t maximum) {
+    if (request.body.size() > maximum) throw clippy::ApiError(413, "request_too_large", "The request is too large.");
+    json body;
+    try { body = json::parse(request.body); }
+    catch (const json::exception&) { throw clippy::ApiError(400, "invalid_json", "The request body is not valid JSON."); }
+    if (!body.is_object()) throw clippy::ApiError(400, "invalid_json", "The request body must be a JSON object.");
+    return body;
+}
+
+std::string body_string(const json& body, const char* key, std::size_t maximum, bool required=true) {
+    if (!body.contains(key)) {
+        if (required) throw clippy::ApiError(400, "invalid_request", std::string(key) + " is required.");
+        return {};
+    }
+    if (!body[key].is_string()) throw clippy::ApiError(400, "invalid_request", std::string(key) + " must be a string.");
+    auto value = body[key].get<std::string>();
+    if ((required && value.empty()) || value.size() > maximum || value.find('\0') != std::string::npos) {
+        throw clippy::ApiError(400, "invalid_request", std::string(key) + " has an invalid length.");
+    }
+    return value;
+}
+
+std::int64_t body_revision(const json& body, const char* key="expected_revision") {
+    if (!body.contains(key) || !body[key].is_number_integer()) throw clippy::ApiError(400, "invalid_request", std::string(key) + " must be an integer.");
+    const auto value = body[key].get<std::int64_t>();
+    if (value < 0) throw clippy::ApiError(400, "invalid_request", std::string(key) + " cannot be negative.");
+    return value;
+}
+
+std::string current_identity() {
+    if (const char* value = std::getenv("USERNAME"); value && *value) return std::string(value).substr(0, 256);
+    if (const char* value = std::getenv("USER"); value && *value) return std::string(value).substr(0, 256);
+    return {};
+}
+
+bool open_directory(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const auto result = reinterpret_cast<std::intptr_t>(ShellExecuteW(nullptr, L"open", path.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    return result > 32;
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+bool process_running_named(const std::string& executable) {
+#ifdef _WIN32
+    std::wstring target(executable.begin(), executable.end());
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (_wcsicmp(entry.szExeFile, target.c_str()) == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return found;
+#else
+    (void)executable;
+    return false;
+#endif
+}
+
 bool storage_host_reachable(const clippy_admin::AdminConfig& config) {
     try {
         httplib::Client client(config.storage_host_address, config.storage_host_port);
@@ -169,6 +246,52 @@ bool storage_host_reachable(const clippy_admin::AdminConfig& config) {
     } catch (...) {
         return false;
     }
+}
+
+json storage_host_post(const clippy_admin::AdminConfig& config, const std::string& path,
+                       json body, const std::string& request_id) {
+    body["api_token"] = config.storage_host_api_token;
+    body["request_id"] = request_id;
+    httplib::Client client(config.storage_host_address, config.storage_host_port);
+    client.set_connection_timeout(2, 0);
+    client.set_read_timeout(15, 0);
+    client.set_write_timeout(5, 0);
+    auto response = client.Post(path, body.dump(), "application/json");
+    if (!response) throw clippy::ApiError(503, "storage_host_unavailable", "ClippyStorageHost is not reachable.", true);
+    json parsed;
+    try { parsed = json::parse(response->body); }
+    catch (...) { throw clippy::ApiError(502, "storage_host_invalid_response", "ClippyStorageHost returned an invalid response.", true); }
+    if (response->status < 200 || response->status >= 300 || parsed.value("ok", false) == false) {
+        const auto error = parsed.value("error", json::object());
+        throw clippy::ApiError(response->status >= 400 ? response->status : 502,
+                               error.value("code", "storage_host_error"),
+                               error.value("message", "ClippyStorageHost rejected the admin operation."),
+                               error.value("retryable", false));
+    }
+    return parsed.value("data", json::object());
+}
+
+json list_backups(const clippy_admin::AdminConfig& config) {
+    json rows = json::array();
+    std::error_code error;
+    if (!std::filesystem::is_directory(config.backup_directory, error)) return {{"rows", rows}};
+    for (const auto& entry : std::filesystem::directory_iterator(config.backup_directory, error)) {
+        if (error) break;
+        if (!entry.is_regular_file()) continue;
+        const auto name = entry.path().filename().string();
+        if (name.rfind("ClippyVirtualCargo-", 0) != 0 || entry.path().extension() != ".dump") continue;
+        std::int64_t created_ms = 0;
+        const auto start = std::string("ClippyVirtualCargo-").size();
+        const auto end = name.find('-', start);
+        if (end != std::string::npos) {
+            try { created_ms = std::stoll(name.substr(start, end - start)); } catch (...) {}
+        }
+        rows.push_back({{"file", name}, {"path", entry.path().string()}, {"bytes", static_cast<std::int64_t>(entry.file_size())},
+                        {"created_ms", created_ms}, {"verification", "verified_when_created"}});
+    }
+    std::sort(rows.begin(), rows.end(), [](const json& a, const json& b) { return a.value("created_ms", 0LL) > b.value("created_ms", 0LL); });
+    if (rows.size() > 100) rows.erase(rows.begin() + 100, rows.end());
+    return {{"rows", rows}};
 }
 
 class SessionStore {
@@ -229,6 +352,7 @@ int main(int argc, char** argv) {
         const auto bootstrap_expires = clippy::now_unix_ms() + 2 * 60 * 1000;
         SessionStore sessions(bootstrap_token, bootstrap_expires);
         clippy_admin::AdminDatabase database(config);
+        const auto windows_identity = current_identity();
 
         std::atomic<std::int64_t> last_activity{clippy::now_unix_ms()};
         std::atomic<bool> stopping{false};
@@ -259,12 +383,12 @@ int main(int argc, char** argv) {
                     send_json(response, 415, failure(clippy::random_hex(8), "json_required", "State-changing requests require application/json."));
                     return httplib::Server::HandlerResponse::Handled;
                 }
-                if (request.get_header_value("Origin") != expected_origin) {
-                    send_json(response, 403, failure(clippy::random_hex(8), "origin_rejected", "The request origin is not allowed."));
+                const auto origin = request.get_header_value("Origin");
+                if (origin != expected_origin) {
+                    send_json(response, 403, failure(clippy::random_hex(8), "origin_rejected", "The request Origin is not allowed."));
                     return httplib::Server::HandlerResponse::Handled;
                 }
             }
-            security_headers(response);
             return httplib::Server::HandlerResponse::Unhandled;
         });
 
@@ -283,19 +407,46 @@ int main(int argc, char** argv) {
             return session;
         };
 
+        auto handle_exception = [&](httplib::Response& response, const std::string& request_id, const std::exception& error) {
+            if (const auto* api = dynamic_cast<const clippy::ApiError*>(&error)) {
+                send_json(response, api->http_status(), failure(request_id, api->code(), api->what(), api->retryable()));
+                return;
+            }
+            if (const auto* pg = dynamic_cast<const clippy::PgError*>(&error)) {
+                std::cerr << "[PG] request " << request_id << " sqlstate=" << pg->sqlstate() << ": " << pg->what() << '\n';
+                send_json(response, 503, failure(request_id, "database_error", "PostgreSQL could not complete the admin request.", true));
+                return;
+            }
+            std::cerr << "[ERROR] request " << request_id << ": " << error.what() << '\n';
+            send_json(response, 500, failure(request_id, "internal_error", "The admin host could not complete the request.", true));
+        };
+
         auto api_get = [&](const std::string& pattern, auto operation) {
             server.Get(pattern, [&, operation](const httplib::Request& request, httplib::Response& response) {
                 if (!authenticated(request, response, false)) return;
                 const auto request_id = clippy::random_hex(8);
                 try { send_json(response, 200, envelope(operation(request))); }
-                catch (const clippy::ApiError& error) { send_json(response, error.http_status(), failure(request_id, error.code(), error.what(), error.retryable())); }
-                catch (const clippy::PgError& error) {
-                    std::cerr << "[PG] request " << request_id << " sqlstate=" << error.sqlstate() << ": " << error.what() << '\n';
-                    send_json(response, 503, failure(request_id, "database_error", "PostgreSQL could not complete the admin query.", true));
-                }
-                catch (const std::exception& error) {
-                    std::cerr << "[ERROR] request " << request_id << ": " << error.what() << '\n';
-                    send_json(response, 500, failure(request_id, "internal_error", "The admin host could not complete the request.", true));
+                catch (const std::exception& error) { handle_exception(response, request_id, error); }
+            });
+        };
+
+        auto api_write = [&](const std::string& pattern, const std::string& action,
+                             const std::string& target_type, auto target_id, auto operation) {
+            server.Post(pattern, [&, action, target_type, target_id, operation](const httplib::Request& request, httplib::Response& response) {
+                if (!authenticated(request, response, true)) return;
+                const auto request_id = clippy::random_hex(8);
+                const auto session_id = request_cookie(request, cookie_name);
+                std::string target;
+                std::string reason;
+                try {
+                    target = target_id(request);
+                    const auto body = parse_body(request, config.max_request_bytes);
+                    if (body.contains("reason") && body["reason"].is_string()) reason = body["reason"].get<std::string>().substr(0, 512);
+                    send_json(response, 200, envelope(operation(request, body, session_id, request_id)));
+                } catch (const std::exception& error) {
+                    try { database.record_external_audit(session_id, windows_identity, action, target_type, target.empty() ? "unknown" : target,
+                                                         "FAILURE", reason, error.what(), request_id); } catch (...) {}
+                    handle_exception(response, request_id, error);
                 }
             });
         };
@@ -303,26 +454,21 @@ int main(int argc, char** argv) {
         server.Post("/api/session/bootstrap", [&](const httplib::Request& request, httplib::Response& response) {
             const auto request_id = clippy::random_hex(8);
             try {
-                if (request.body.size() > config.max_request_bytes) throw clippy::ApiError(413, "request_too_large", "The request is too large.");
-                const auto body = json::parse(request.body);
-                if (!body.is_object() || !body.contains("token") || !body["token"].is_string()) throw clippy::ApiError(400, "invalid_json", "A bootstrap token is required.");
+                const auto body = parse_body(request, config.max_request_bytes);
+                if (!body.contains("token") || !body["token"].is_string()) throw clippy::ApiError(400, "invalid_json", "A bootstrap token is required.");
                 auto created = sessions.bootstrap(body["token"].get<std::string>());
                 if (!created) throw clippy::ApiError(401, "bootstrap_rejected", "The bootstrap token is invalid, expired, or already used.");
                 last_activity.store(clippy::now_unix_ms(), std::memory_order_relaxed);
                 response.set_header("Set-Cookie", std::string(cookie_name) + "=" + created->first + "; Path=/; HttpOnly; SameSite=Strict");
-                send_json(response, 200, envelope(json{{"csrf", created->second}, {"read_only", true}}));
-            } catch (const clippy::ApiError& error) {
-                send_json(response, error.http_status(), failure(request_id, error.code(), error.what(), error.retryable()));
-            } catch (const json::exception&) {
-                send_json(response, 400, failure(request_id, "invalid_json", "The request body is not valid JSON."));
-            }
+                send_json(response, 200, envelope(json{{"csrf", created->second}, {"read_only", !database.editing_enabled()}, {"editing_enabled", database.editing_enabled()}}));
+            } catch (const std::exception& error) { handle_exception(response, request_id, error); }
         });
 
         api_get("/api/session", [&](const httplib::Request& request) {
             const auto session_id = request_cookie(request, cookie_name);
             auto session = sessions.authenticate(session_id);
             if (!session) throw clippy::ApiError(401, "unauthorized", "A valid local admin session is required.");
-            return json{{"csrf", session->csrf}, {"read_only", true}};
+            return json{{"csrf", session->csrf}, {"read_only", !database.editing_enabled()}, {"editing_enabled", database.editing_enabled()}, {"identity", windows_identity}};
         });
 
         server.Post("/api/session/logout", [&](const httplib::Request& request, httplib::Response& response) {
@@ -338,7 +484,7 @@ int main(int argc, char** argv) {
             try { pg = database.health(); pg_ok = true; }
             catch (const std::exception& error) { std::cerr << "[PG] health check failed: " << error.what() << '\n'; pg = {{"error", "unavailable"}}; }
             return json{{"postgres", {{"ok", pg_ok}, {"detail", pg}}}, {"storage_host_reachable", storage_host_reachable(config)},
-                        {"read_only", true}, {"version", admin_version}};
+                        {"dayz_server_running", process_running_named(config.dayz_executable_name)}, {"read_only", !database.editing_enabled()}, {"editing_enabled", database.editing_enabled()}, {"version", admin_version}};
         });
 
         api_get("/api/overview", [&](const httplib::Request&) {
@@ -346,13 +492,39 @@ int main(int argc, char** argv) {
             data["postgres_ok"] = true;
             data["postgres_version"] = database.health().value("postgres_version", "unknown");
             data["storage_host_reachable"] = storage_host_reachable(config);
+            data["dayz_server_running"] = process_running_named(config.dayz_executable_name);
             return data;
         });
+        api_get("/api/settings", [&](const httplib::Request&) {
+            return json{{"listen_address","127.0.0.1"},{"port",config.port},{"idle_shutdown_minutes",config.idle_shutdown_minutes},
+                        {"http_threads",config.http_threads},{"max_queued_requests",config.max_queued_requests},
+                        {"max_request_bytes",static_cast<std::int64_t>(config.max_request_bytes)},
+                        {"storage_host_address",config.storage_host_address},{"storage_host_port",config.storage_host_port},
+                        {"postgres_host",config.postgres.postgres_host},{"postgres_port",config.postgres.postgres_port},
+                        {"postgres_database",config.postgres.postgres_database},{"postgres_read_role",config.postgres.postgres_user},
+                        {"postgres_read_pool_size",config.postgres.postgres_pool_size},{"editing_enabled",database.editing_enabled()},
+                        {"maintenance_lock_seconds",config.maintenance_lock_seconds},{"export_directory",config.export_directory.string()},
+                        {"player_telemetry_enabled",config.player_telemetry_enabled},
+                        {"player_network_telemetry_enabled",config.player_network_telemetry_enabled},
+                        {"player_position_telemetry_enabled",config.player_position_telemetry_enabled},
+                        {"live_player_control_enabled",config.live_player_control_enabled},
+                        {"player_snapshot_interval_seconds",config.player_snapshot_interval_seconds},
+                        {"player_command_expiry_seconds",config.player_command_expiry_seconds},
+                        {"player_telemetry_retention_days",config.player_telemetry_retention_days},
+                        {"player_snapshot_history_limit",config.player_snapshot_history_limit},
+                        {"admin_audit_retention_days",config.admin_audit_retention_days},
+                        {"player_ip_collection_supported",false},
+                        {"player_ip_collection_note","The supported DayZ server script API does not expose player IP addresses to this mod."},
+                        {"dayz_executable_name",config.dayz_executable_name}};
+        });
         api_get("/api/containers", [&](const httplib::Request& request) {
-            return database.containers(bounded_query_string(request, "q", 128), bounded_query_string(request, "after", 128), bounded_query_int(request, "limit", 50, 1, 100));
+            return database.containers(bounded_query_string(request, "q", 128), bounded_query_string(request, "after", 128),
+                                       bounded_query_string(request, "contains", 128), bounded_query_string(request, "status", 32),
+                                       bounded_query_i64(request, "min_nodes", 0), bounded_query_int(request, "stale_days", 0, 0, 36500),
+                                       bounded_query_int(request, "limit", 50, 1, 100));
         });
         api_get(R"(/api/containers/([0-9A-Za-z._:-]{1,128}))", [&](const httplib::Request& request) {
-            return database.container(request.matches[1].str());
+            return database.container(request.matches[1].str(), request_cookie(request, cookie_name));
         });
         api_get(R"(/api/containers/([0-9A-Za-z._:-]{1,128})/roots)", [&](const httplib::Request& request) {
             return database.roots(request.matches[1].str(), bounded_query_string(request, "after", 128), bounded_query_int(request, "limit", 50, 1, 100));
@@ -363,23 +535,272 @@ int main(int argc, char** argv) {
         api_get("/api/items/search", [&](const httplib::Request& request) {
             constexpr double search_maximum = 1.0e15;
             return database.search_items(
-                bounded_query_string(request, "q", 128),
-                bounded_query_string(request, "after_class", 256),
-                bounded_query_string(request, "after_storage", 128),
-                bounded_query_string(request, "after_root", 128),
+                bounded_query_string(request, "q", 128), bounded_query_string(request, "after_class", 256),
+                bounded_query_string(request, "after_storage", 128), bounded_query_string(request, "after_root", 128),
                 bounded_query_string(request, "after_item", 128),
                 bounded_query_double(request, "min_quantity", 0.0, 0.0, search_maximum),
                 bounded_query_double(request, "max_quantity", search_maximum, 0.0, search_maximum),
                 bounded_query_double(request, "min_health", 0.0, 0.0, search_maximum),
                 bounded_query_double(request, "max_health", search_maximum, 0.0, search_maximum),
+                bounded_query_string(request, "adapter_id", 128),
+                bounded_query_string(request, "location_type", 64),
                 bounded_query_int(request, "limit", 50, 1, 100));
         });
         api_get("/api/sessions", [&](const httplib::Request& request) {
-            return database.sessions(bounded_query_i64(request, "before_ms", 0), bounded_query_string(request, "before_id", 128),
-                                     bounded_query_int(request, "limit", 75, 1, 100));
+            return database.sessions(bounded_query_i64(request, "before_ms", 0), bounded_query_string(request, "before_id", 128), bounded_query_int(request, "limit", 75, 1, 100));
+        });
+        api_get("/api/players", [&](const httplib::Request& request) {
+            const auto online_window = static_cast<std::int64_t>(config.player_snapshot_interval_seconds) * 2500;
+            return database.players(bounded_query_string(request,"q",128), bounded_query_i64(request,"before_ms",0),
+                                    bounded_query_string(request,"before_id",128), bounded_query_int(request,"limit",50,1,100), online_window);
+        });
+        api_get(R"(/api/players/([0-9A-Za-z._:-]{1,128}))", [&](const httplib::Request& request) {
+            const auto online_window = static_cast<std::int64_t>(config.player_snapshot_interval_seconds) * 2500;
+            return database.player_detail(request.matches[1].str(), online_window);
+        });
+        api_get(R"(/api/players/([0-9A-Za-z._:-]{1,128})/snapshots/([0-9A-Za-z._:-]{1,128}))", [&](const httplib::Request& request) {
+            return database.player_snapshot_tree(request.matches[1].str(),request.matches[2].str());
+        });
+        api_get("/api/player-items/search", [&](const httplib::Request& request) {
+            return database.search_player_items(bounded_query_string(request,"q",128), bounded_query_string(request,"player_id",128),
+                                                bounded_query_string(request,"after_class",256), bounded_query_string(request,"after_player",128),
+                                                bounded_query_string(request,"after_item",192), bounded_query_int(request,"limit",50,1,100));
+        });
+        api_get("/api/player-commands", [&](const httplib::Request& request) {
+            return database.player_commands(bounded_query_string(request,"player_id",128), bounded_query_i64(request,"before_ms",0),
+                                            bounded_query_string(request,"before_id",128), bounded_query_int(request,"limit",50,1,100));
+        });
+        api_get("/api/player-quarantine", [&](const httplib::Request& request) {
+            return database.player_quarantine(bounded_query_string(request,"player_id",128), bounded_query_i64(request,"before_ms",0),
+                                              bounded_query_string(request,"before_id",128), bounded_query_int(request,"limit",50,1,100));
         });
         api_get("/api/recovery", [&](const httplib::Request&) { return database.recovery(); });
         api_get("/api/database/info", [&](const httplib::Request&) { return database.database_info(); });
+        api_get("/api/reports", [&](const httplib::Request& request) {
+            return database.report(bounded_query_string(request,"kind",64), bounded_query_int(request,"limit",25,1,50));
+        });
+        api_get(R"(/api/database/table/([A-Za-z0-9_]{1,64}))", [&](const httplib::Request& request) {
+            return database.table_preview(request.matches[1].str(), bounded_query_string(request, "after", 32),
+                                          bounded_query_int(request, "limit", 50, 1, 100));
+        });
+        api_get("/api/admin/changes", [&](const httplib::Request& request) {
+            return database.changes(bounded_query_string(request, "storage_id", 128), bounded_query_i64(request, "before_ms", 0),
+                                    bounded_query_string(request, "before_id", 128), bounded_query_int(request, "limit", 75, 1, 100));
+        });
+        api_get(R"(/api/admin/changes/([0-9A-Za-z._:-]{1,128}))", [&](const httplib::Request& request) {
+            return database.change_detail(request.matches[1].str());
+        });
+        api_get(R"(/api/items/([0-9A-Za-z._:-]{1,128})/history)", [&](const httplib::Request& request) {
+            return database.item_history(request.matches[1].str(), bounded_query_i64(request, "before_ms", 0),
+                                         bounded_query_string(request, "before_id", 128), bounded_query_int(request, "limit", 50, 1, 100));
+        });
+        api_get("/api/audit", [&](const httplib::Request& request) {
+            return database.audit(bounded_query_i64(request, "before_ms", 0), bounded_query_i64(request, "before_id", 0),
+                                  bounded_query_i64(request, "from_ms", 0), bounded_query_i64(request, "to_ms", 0),
+                                  bounded_query_int(request, "limit", 75, 1, 100),
+                                  bounded_query_string(request, "admin", 128), bounded_query_string(request, "action", 128),
+                                  bounded_query_string(request, "target_type", 64), bounded_query_string(request, "target_id", 128),
+                                  bounded_query_string(request, "result", 32));
+        });
+        api_get("/api/activity", [&](const httplib::Request& request) {
+            return database.activity(bounded_query_i64(request, "before_ms", 0), bounded_query_i64(request, "before_id", 0),
+                                     bounded_query_i64(request, "from_ms", 0), bounded_query_i64(request, "to_ms", 0),
+                                     bounded_query_int(request, "limit", 75, 1, 100),
+                                     bounded_query_string(request, "target", 128), bounded_query_string(request, "event", 128),
+                                     bounded_query_string(request, "source", 32));
+        });
+        api_get("/api/quarantine", [&](const httplib::Request& request) {
+            return database.quarantine(bounded_query_i64(request, "before_ms", 0), bounded_query_string(request, "before_id", 128), bounded_query_int(request, "limit", 75, 1, 100));
+        });
+        api_get("/api/snapshots", [&](const httplib::Request& request) {
+            return database.snapshots(bounded_query_string(request, "storage_id", 128), bounded_query_i64(request, "before_ms", 0),
+                                      bounded_query_string(request, "before_id", 128), bounded_query_int(request, "limit", 75, 1, 100));
+        });
+        api_get(R"(/api/snapshots/([0-9A-Za-z._:-]{1,128})/compare)", [&](const httplib::Request& request) {
+            return database.snapshot_compare(request.matches[1].str(), bounded_query_string(request, "after", 128),
+                                             bounded_query_int(request, "limit", 75, 1, 100));
+        });
+        api_get("/api/backups", [&](const httplib::Request&) { return list_backups(config); });
+        api_get("/api/locks", [&](const httplib::Request& request) {
+            return database.locks(bounded_query_i64(request, "before_expiry_ms", 0),
+                                  bounded_query_string(request, "before_storage_id", 128),
+                                  bounded_query_int(request, "limit", 75, 1, 100));
+        });
+
+        api_write("/api/bulk/preview", "bulk_preview", "selection",
+                  [](const httplib::Request&) { return std::string("bulk"); },
+                  [&](const httplib::Request&, const json& body, const std::string& session_id, const std::string&) {
+            if (!body.contains("items")) throw clippy::ApiError(400, "invalid_request", "items is required.");
+            return database.bulk_preview(body["items"], session_id);
+        });
+        api_write("/api/bulk/roots", "bulk_root_change", "selection",
+                  [](const httplib::Request&) { return std::string("bulk"); },
+                  [&](const httplib::Request&, const json& body, const std::string& session_id, const std::string& request_id) {
+            if (!body.contains("items")) throw clippy::ApiError(400, "invalid_request", "items is required.");
+            const auto action = body_string(body, "action", 32);
+            if (action != "quarantine" && action != "remove") {
+                throw clippy::ApiError(400, "invalid_bulk_action", "Bulk root action must be quarantine or remove.");
+            }
+            return database.bulk_remove_roots(body["items"], action == "quarantine", body_string(body,"reason",512),
+                                              session_id, windows_identity, request_id);
+        });
+        api_write("/api/bulk/transfer/preview", "bulk_transfer_preview", "selection",
+                  [](const httplib::Request&) { return std::string("bulk-transfer"); },
+                  [&](const httplib::Request&, const json& body, const std::string& session_id, const std::string&) {
+            if (!body.contains("items")) throw clippy::ApiError(400, "invalid_request", "items is required.");
+            return database.bulk_transfer_preview(body["items"], body_string(body,"target_storage_id",128),
+                                                   body_revision(body,"target_expected_revision"), session_id);
+        });
+        api_write("/api/bulk/transfer", "bulk_transfer_roots", "selection",
+                  [](const httplib::Request&) { return std::string("bulk-transfer"); },
+                  [&](const httplib::Request&, const json& body, const std::string& session_id, const std::string& request_id) {
+            if (!body.contains("items")) throw clippy::ApiError(400, "invalid_request", "items is required.");
+            const auto action = body_string(body, "action", 16);
+            if (action != "move" && action != "copy") throw clippy::ApiError(400, "invalid_bulk_action", "Bulk transfer action must be move or copy.");
+            return database.bulk_transfer_roots(body["items"], body_string(body,"target_storage_id",128),
+                                                body_revision(body,"target_expected_revision"), action == "copy",
+                                                body_string(body,"reason",512), session_id, windows_identity, request_id);
+        });
+
+        api_write(R"(/api/items/([0-9A-Za-z._:-]{1,128})/edit)", "edit_item", "item",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            const auto item_id = request.matches[1].str();
+            if (!body.contains("patch")) throw clippy::ApiError(400, "invalid_request", "patch is required.");
+            return database.edit_item(body_string(body,"storage_id",128), body_string(body,"root_item_id",128), item_id,
+                                      body_revision(body), body["patch"], body_string(body,"reason",512,false),
+                                      session_id, windows_identity, request_id);
+        });
+        api_write(R"(/api/items/([0-9A-Za-z._:-]{1,128})/remove)", "remove_item", "item",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            return database.remove_item(body_string(body,"storage_id",128), body_string(body,"root_item_id",128), request.matches[1].str(),
+                                        body_revision(body), false, body_string(body,"reason",512,false), session_id, windows_identity, request_id);
+        });
+        api_write(R"(/api/items/([0-9A-Za-z._:-]{1,128})/quarantine)", "quarantine_item", "item",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            return database.remove_item(body_string(body,"storage_id",128), body_string(body,"root_item_id",128), request.matches[1].str(),
+                                        body_revision(body), true, body_string(body,"reason",512,false), session_id, windows_identity, request_id);
+        });
+        api_write(R"(/api/items/([0-9A-Za-z._:-]{1,128})/(move|copy))", "move_or_copy_item", "item",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            return database.copy_or_move_item(body_string(body,"storage_id",128), body_string(body,"root_item_id",128), request.matches[1].str(),
+                                              body_revision(body), body_string(body,"target_storage_id",128), body_revision(body,"target_expected_revision"),
+                                              request.matches[2].str()=="copy", body_string(body,"reason",512,false), session_id, windows_identity, request_id);
+        });
+        api_write(R"(/api/containers/([0-9A-Za-z._:-]{1,128})/export)", "export_container", "container",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json&, const std::string&, const std::string&) {
+            return database.export_container(request.matches[1].str(), config.export_directory);
+        });
+        api_write("/api/exports/open-folder", "open_export_folder", "export_folder",
+                  [](const httplib::Request&) { return std::string("configured"); },
+                  [&](const httplib::Request&, const json&, const std::string&, const std::string&) {
+            std::error_code error;
+            std::filesystem::create_directories(config.export_directory, error);
+            if (error || !open_directory(config.export_directory)) {
+                throw clippy::ApiError(500, "open_folder_failed", "Windows could not open the admin export folder.");
+            }
+            return json{{"opened",true}};
+        });
+
+        api_write(R"(/api/containers/([0-9A-Za-z._:-]{1,128})/lock)", "acquire_maintenance_lock", "container",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            return database.acquire_manual_lock(request.matches[1].str(), body_revision(body), body_string(body,"reason",512),
+                                                session_id, windows_identity, request_id);
+        });
+        api_write(R"(/api/containers/([0-9A-Za-z._:-]{1,128})/unlock)", "release_maintenance_lock", "container",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            return database.release_manual_lock(request.matches[1].str(), body_string(body,"reason",512,false),
+                                                session_id, windows_identity, request_id);
+        });
+
+        api_write(R"(/api/containers/([0-9A-Za-z._:-]{1,128})/snapshot)", "create_snapshot", "container",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            return database.create_snapshot(request.matches[1].str(), body_revision(body), body_string(body,"reason",512,false),
+                                            session_id, windows_identity, request_id);
+        });
+        api_write(R"(/api/quarantine/([0-9A-Za-z._:-]{1,128})/restore)", "restore_quarantine", "quarantine",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            return database.restore_quarantine(request.matches[1].str(), body_revision(body), body_string(body,"reason",512,false),
+                                               session_id, windows_identity, request_id);
+        });
+        api_write(R"(/api/admin/changes/([0-9A-Za-z._:-]{1,128})/undo)", "undo_change", "change",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            return database.undo_change(request.matches[1].str(), body_string(body,"reason",512,false), session_id, windows_identity, request_id);
+        });
+        api_write(R"(/api/recovery/operations/([0-9A-Za-z._:-]{1,128})/abort)", "abort_operation", "operation",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            if (!database.editing_enabled()) throw clippy::ApiError(403,"editing_disabled","Admin editing is disabled in ClippyServerManager.json.");
+            const auto reason = body_string(body,"reason",512,false);
+            auto result = storage_host_post(config, "/v1/operation/abort", {{"operation_id",request.matches[1].str()},{"reason",reason.empty()?"aborted from Clippy Admin":reason}}, request_id);
+            database.record_external_audit(session_id, windows_identity, "abort_operation", "operation", request.matches[1].str(), "SUCCESS", reason, "", request_id, result);
+            return result;
+        });
+        api_write(R"(/api/recovery/sessions/([0-9A-Za-z._:-]{1,128})/abort)", "abort_session", "session",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            if (!database.editing_enabled()) throw clippy::ApiError(403,"editing_disabled","Admin editing is disabled in ClippyServerManager.json.");
+            const auto reason = body_string(body,"reason",512,false);
+            auto result = storage_host_post(config, "/v1/session/abort", {{"session_id",request.matches[1].str()},{"reason",reason.empty()?"aborted from Clippy Admin":reason}}, request_id);
+            database.record_external_audit(session_id, windows_identity, "abort_session", "session", request.matches[1].str(), "SUCCESS", reason, "", request_id, result);
+            return result;
+        });
+        api_write("/api/recovery/integrity", "run_integrity_check", "database",
+                  [](const httplib::Request&) { return std::string("clippy_virtual_cargo"); },
+                  [&](const httplib::Request&, const json& body, const std::string& session_id, const std::string& request_id) {
+            const auto reason = body_string(body,"reason",512,false);
+            auto result = storage_host_post(config, "/v1/admin/integrity", json::object(), request_id);
+            database.record_external_audit(session_id, windows_identity, "run_integrity_check", "database", "clippy_virtual_cargo", "SUCCESS", reason, "", request_id, result);
+            return result;
+        });
+        api_write("/api/backups/open-folder", "open_backup_folder", "backup_folder",
+                  [](const httplib::Request&) { return std::string("configured"); },
+                  [&](const httplib::Request&, const json&, const std::string&, const std::string&) {
+            std::error_code error;
+            std::filesystem::create_directories(config.backup_directory, error);
+            if (error || !open_directory(config.backup_directory)) {
+                throw clippy::ApiError(500, "open_folder_failed", "Windows could not open the configured backup folder.");
+            }
+            return json{{"opened",true}};
+        });
+        api_write("/api/backups", "create_backup", "database",
+                  [](const httplib::Request&) { return std::string("clippy_virtual_cargo"); },
+                  [&](const httplib::Request&, const json& body, const std::string& session_id, const std::string& request_id) {
+            const auto reason = body_string(body,"reason",512,false);
+            auto result = storage_host_post(config, "/v1/admin/backup", json::object(), request_id);
+            database.record_external_audit(session_id, windows_identity, "create_backup", "database", "clippy_virtual_cargo", "SUCCESS", reason, "", request_id, result);
+            return result;
+        });
+        api_write(R"(/api/backups/([A-Za-z0-9._-]{1,128})/verify)", "verify_backup", "backup",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            const auto reason = body_string(body,"reason",512,false);
+            auto result = storage_host_post(config, "/v1/admin/backup/verify", {{"filename",request.matches[1].str()}}, request_id);
+            database.record_external_audit(session_id, windows_identity, "verify_backup", "backup", request.matches[1].str(), "SUCCESS", reason, "", request_id, result);
+            return result;
+        });
+
+        api_write(R"(/api/players/([0-9A-Za-z._:-]{1,128})/commands)", "enqueue_player_command", "player",
+                  [](const httplib::Request& request) { return request.matches[1].str(); },
+                  [&](const httplib::Request& request, const json& body, const std::string& session_id, const std::string& request_id) {
+            if (!config.player_telemetry_enabled || !config.live_player_control_enabled) {
+                throw clippy::ApiError(409,"live_player_control_disabled","Player telemetry and live player control must be enabled in ClippyServerManager.json.");
+            }
+            if (!body.contains("action") || !body["action"].is_string()) throw clippy::ApiError(400,"invalid_json","action is required.");
+            const auto payload = body.contains("payload") ? body["payload"] : json::object();
+            return database.enqueue_player_command(request.matches[1].str(), body["action"].get<std::string>(), payload,
+                                                   body_string(body,"reason",512,false), config.player_command_expiry_seconds,
+                                                   session_id, windows_identity, request_id);
+        });
 
         server.Get("/assets/styles.css", [&](const httplib::Request&, httplib::Response& response) {
             security_headers(response); response.set_content(clippy_admin::assets::styles_css.data(), clippy_admin::assets::styles_css.size(), "text/css; charset=utf-8");
@@ -409,7 +830,8 @@ int main(int argc, char** argv) {
             }
         });
 
-        std::cout << "ClippyAdminHost " << admin_version << " listening on 127.0.0.1:" << config.port << " (read-only)\n";
+        std::cout << "ClippyAdminHost " << admin_version << " listening on 127.0.0.1:" << config.port
+                  << (database.editing_enabled() ? " (safe editing enabled)\n" : " (read-only)\n");
         const bool listened = server.listen("127.0.0.1", config.port);
         stopping.store(true, std::memory_order_release);
         if (idle_thread.joinable()) idle_thread.join();

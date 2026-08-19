@@ -1,5 +1,5 @@
 {
-  "ConfigVersion": 5,
+  "ConfigVersion": 6,
   "ServerRoot": "Auto",
   "ServerExecutable": "DayZServer_x64.exe",
   "BaseStartScript": "StartServer.bat",
@@ -23,6 +23,20 @@
     "Port": 27817,
     "AutoOpenBrowser": true,
     "IdleShutdownMinutes": 30,
-    "EnableEditing": false
+    "EnableEditing": true,
+    "MaintenanceLockSeconds": 300,
+    "PostgresWritePoolSize": 2,
+    "PostgresWriteStatementTimeoutMs": 5000,
+    "PostgresWriteLockTimeoutMs": 1500,
+    "EnablePlayerTelemetry": false,
+    "EnablePlayerNetworkTelemetry": true,
+    "EnablePlayerPositionTelemetry": true,
+    "PlayerSnapshotIntervalSeconds": 120,
+    "PlayerTelemetryRetentionDays": 30,
+    "PlayerSnapshotHistoryLimit": 250,
+    "AdminAuditRetentionDays": 90,
+    "EnableLivePlayerControl": false,
+    "PlayerCommandPollIntervalSeconds": 2,
+    "PlayerCommandExpirySeconds": 30
   }
 }

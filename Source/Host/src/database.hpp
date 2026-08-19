@@ -22,6 +22,7 @@ public:
     StorageDatabase& operator=(const StorageDatabase&) = delete;
 
     nlohmann::json resolve_container(const nlohmann::json& request);
+    nlohmann::json observe_container(const nlohmann::json& request);
     nlohmann::json snapshot(const nlohmann::json& request);
     nlohmann::json item_tree(const nlohmann::json& request);
     nlohmann::json prepare_deposit(const nlohmann::json& request);
@@ -48,7 +49,11 @@ public:
     nlohmann::json rebuild_item_index_batch(const nlohmann::json& request);
     nlohmann::json quick_check();
     nlohmann::json backup(const nlohmann::json& request);
+    nlohmann::json verify_backup(const nlohmann::json& request);
     nlohmann::json metrics(const nlohmann::json& request);
+    nlohmann::json player_snapshot(const nlohmann::json& request);
+    nlohmann::json poll_player_commands(const nlohmann::json& request);
+    nlohmann::json complete_player_command(const nlohmann::json& request);
     nlohmann::json migrate_legacy_sqlite(const std::filesystem::path& legacy_database,
                                          const std::string& expected_fingerprint = {});
 

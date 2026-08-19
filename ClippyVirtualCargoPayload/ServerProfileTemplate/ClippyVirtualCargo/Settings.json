@@ -1,5 +1,5 @@
 {
-  "Version": 5,
+  "Version": 7,
   "Enabled": true,
   "HostURL": "http://127.0.0.1:27815",
   "ApiToken": "REPLACE_WITH_THE_SAME_RANDOM_TOKEN_IN_BOTH_CONFIGURATION_FILES",
@@ -32,5 +32,12 @@
     "ExplosivesBase",
     "TrapBase"
   ],
-  "MaterializationIntervalMs": 1
+  "MaterializationIntervalMs": 1,
+  "EnablePlayerTelemetry": false,
+  "EnablePlayerNetworkTelemetry": true,
+  "EnablePlayerPositionTelemetry": true,
+  "PlayerSnapshotIntervalSeconds": 120,
+  "EnableLivePlayerControl": false,
+  "PlayerCommandPollIntervalSeconds": 2,
+  "PlayerCommandExpirySeconds": 30
 }

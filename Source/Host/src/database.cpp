@@ -33,7 +33,7 @@ using nlohmann::json;
 
 namespace {
 
-constexpr int schema_version = 8;
+constexpr int schema_version = 11;
 
 std::string required_string(const json& value, const char* key, std::size_t maximum = 512) {
     if (!value.contains(key) || !value[key].is_string()) {
@@ -240,6 +240,18 @@ void assert_storage_workflow_available(PgPool* database, const std::string& stor
     Statement storage_lock(database, "SELECT storage_id FROM storage_containers WHERE storage_id=?1 FOR UPDATE");
     storage_lock.bind(1, storage_id);
     if (!storage_lock.row()) throw ApiError(404, "storage_not_found", "The storage container does not exist.");
+    Statement expired_lock(database, "DELETE FROM admin_container_locks WHERE storage_id=?1 AND expires_ms<=?2");
+    expired_lock.bind(1, storage_id);
+    expired_lock.bind(2, now_unix_ms());
+    expired_lock.done();
+    Statement maintenance(database,
+        "SELECT lock_reason,expires_ms FROM admin_container_locks WHERE storage_id=?1 LIMIT 1");
+    maintenance.bind(1, storage_id);
+    if (maintenance.row()) {
+        throw ApiError(409, "admin_maintenance",
+                       "Storage is temporarily locked for local admin maintenance. Try again after the admin change is finished.",
+                       true);
+    }
     Statement active(database,
         "SELECT workflow_kind,workflow_id,status FROM ("
         "SELECT 'direct operation' AS workflow_kind,operation_id AS workflow_id,status "
@@ -305,6 +317,55 @@ std::size_t collect_item_ids(const json& node, json& ids) {
     std::size_t count = 1;
     for (const auto& child : node.at("children")) count += collect_item_ids(child, ids);
     return count;
+}
+
+void validate_telemetry_node(const json& node, std::size_t depth, std::size_t& count,
+                             std::unordered_set<std::string>& item_ids, const HostConfig& config) {
+    if (!node.is_object()) throw ApiError(400, "invalid_player_snapshot", "Every player inventory node must be an object.");
+    if (depth > static_cast<std::size_t>(config.max_item_depth)) {
+        throw ApiError(400, "player_snapshot_too_deep", "The player inventory snapshot is too deeply nested.");
+    }
+    if (++count > static_cast<std::size_t>(config.max_item_nodes)) {
+        throw ApiError(400, "player_snapshot_too_large", "The player inventory snapshot contains too many item nodes.");
+    }
+    const auto item_id = required_string(node, "item_id", 192);
+    required_string(node, "class_name", 256);
+    if (!item_ids.insert(item_id).second) {
+        throw ApiError(400, "duplicate_player_item_id", "The player inventory snapshot contains a duplicate item ID.");
+    }
+    const double quantity = node.value("quantity", 0.0);
+    const double health = node.value("health", 0.0);
+    if (!std::isfinite(quantity) || !std::isfinite(health) || quantity < 0.0 || health < 0.0) {
+        throw ApiError(400, "invalid_player_snapshot", "Player item quantity and health must be finite non-negative values.");
+    }
+    if (node.contains("children")) {
+        if (!node["children"].is_array()) {
+            throw ApiError(400, "invalid_player_snapshot", "Player item children must be an array.");
+        }
+        for (const auto& child : node["children"]) {
+            validate_telemetry_node(child, depth + 1, count, item_ids, config);
+        }
+    }
+}
+
+std::string bounded_optional_string(const json& request, const char* key, std::size_t maximum) {
+    if (!request.contains(key) || request[key].is_null()) return {};
+    if (!request[key].is_string()) throw ApiError(400, "invalid_request", std::string(key) + " must be a string.");
+    const auto value = request[key].get<std::string>();
+    if (value.size() > maximum || value.find('\0') != std::string::npos) {
+        throw ApiError(400, "invalid_request", std::string(key) + " is too long or contains a NUL byte.");
+    }
+    return value;
+}
+
+double optional_coordinate(const json& request, const char* key) {
+    if (!request.contains(key) || request[key].is_null()) return std::numeric_limits<double>::quiet_NaN();
+    if (!request[key].is_number()) throw ApiError(400, "invalid_request", std::string(key) + " must be numeric.");
+    const double value = request[key].get<double>();
+    if (!std::isfinite(value) || std::abs(value) > 1000000.0) {
+        throw ApiError(400, "invalid_request", std::string(key) + " is outside the supported world coordinate range.");
+    }
+    return value;
 }
 
 void collect_item_index_rows(const std::string& storage_id,
@@ -662,10 +723,28 @@ CREATE TABLE IF NOT EXISTS storage_containers(
     display_name TEXT NOT NULL,
     capacity_slots BIGINT NOT NULL CHECK(capacity_slots >= 0),
     revision BIGINT NOT NULL DEFAULT 0 CHECK(revision >= 0),
+    container_class TEXT NOT NULL DEFAULT '',
+    world_position_x DOUBLE PRECISION,
+    world_position_y DOUBLE PRECISION,
+    world_position_z DOUBLE PRECISION,
+    map_name TEXT NOT NULL DEFAULT '',
+    first_seen_ms BIGINT,
+    last_seen_ms BIGINT,
     created_ms BIGINT NOT NULL,
     updated_ms BIGINT NOT NULL,
     UNIQUE(provider_id, provider_key)
 ) WITH (fillfactor=80, autovacuum_vacuum_scale_factor=0.05, autovacuum_analyze_scale_factor=0.02);
+ALTER TABLE storage_containers ADD COLUMN IF NOT EXISTS container_class TEXT NOT NULL DEFAULT '';
+ALTER TABLE storage_containers ADD COLUMN IF NOT EXISTS world_position_x DOUBLE PRECISION;
+ALTER TABLE storage_containers ADD COLUMN IF NOT EXISTS world_position_y DOUBLE PRECISION;
+ALTER TABLE storage_containers ADD COLUMN IF NOT EXISTS world_position_z DOUBLE PRECISION;
+ALTER TABLE storage_containers ADD COLUMN IF NOT EXISTS map_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE storage_containers ADD COLUMN IF NOT EXISTS first_seen_ms BIGINT;
+ALTER TABLE storage_containers ADD COLUMN IF NOT EXISTS last_seen_ms BIGINT;
+CREATE INDEX IF NOT EXISTS storage_containers_class_seen
+    ON storage_containers((lower(container_class)) text_pattern_ops,last_seen_ms DESC,storage_id);
+CREATE INDEX IF NOT EXISTS storage_containers_last_seen
+    ON storage_containers(last_seen_ms DESC,storage_id);
 
 CREATE TABLE IF NOT EXISTS cargo_roots(
     storage_id TEXT NOT NULL REFERENCES storage_containers(storage_id) ON DELETE CASCADE,
@@ -890,6 +969,227 @@ CREATE TABLE IF NOT EXISTS audit_events(
 );
 CREATE INDEX IF NOT EXISTS audit_events_retention ON audit_events(created_ms,event_id);
 
+CREATE TABLE IF NOT EXISTS admin_container_locks(
+    storage_id TEXT PRIMARY KEY REFERENCES storage_containers(storage_id) ON DELETE CASCADE,
+    lock_id TEXT NOT NULL UNIQUE,
+    admin_session_id TEXT NOT NULL,
+    lock_reason TEXT NOT NULL,
+    created_ms BIGINT NOT NULL,
+    expires_ms BIGINT NOT NULL CHECK(expires_ms > created_ms)
+);
+CREATE INDEX IF NOT EXISTS admin_container_locks_expiry ON admin_container_locks(expires_ms);
+
+CREATE TABLE IF NOT EXISTS admin_change_sets(
+    change_id TEXT PRIMARY KEY,
+    admin_session_id TEXT NOT NULL,
+    windows_identity TEXT NOT NULL DEFAULT '',
+    action_type TEXT NOT NULL,
+    storage_id TEXT NOT NULL REFERENCES storage_containers(storage_id),
+    target_storage_id TEXT REFERENCES storage_containers(storage_id),
+    item_id TEXT,
+    before_revision BIGINT NOT NULL CHECK(before_revision >= 0),
+    after_revision BIGINT NOT NULL CHECK(after_revision >= before_revision),
+    target_before_revision BIGINT,
+    target_after_revision BIGINT,
+    reason TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('APPLIED','UNDONE')),
+    created_ms BIGINT NOT NULL,
+    undone_ms BIGINT,
+    undo_change_id TEXT
+) WITH (fillfactor=90);
+CREATE INDEX IF NOT EXISTS admin_change_sets_storage_history ON admin_change_sets(storage_id,created_ms DESC,change_id DESC);
+CREATE INDEX IF NOT EXISTS admin_change_sets_created ON admin_change_sets(created_ms DESC,change_id DESC);
+
+CREATE TABLE IF NOT EXISTS admin_change_entries(
+    entry_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    change_id TEXT NOT NULL REFERENCES admin_change_sets(change_id),
+    storage_id TEXT NOT NULL REFERENCES storage_containers(storage_id),
+    root_item_id TEXT NOT NULL,
+    item_id TEXT,
+    entry_kind TEXT NOT NULL CHECK(entry_kind IN ('ROOT','ITEM')),
+    before_state JSONB,
+    after_state JSONB
+);
+CREATE INDEX IF NOT EXISTS admin_change_entries_change ON admin_change_entries(change_id,entry_id);
+CREATE INDEX IF NOT EXISTS admin_change_entries_item ON admin_change_entries(item_id,change_id);
+
+CREATE TABLE IF NOT EXISTS admin_quarantine(
+    quarantine_id TEXT PRIMARY KEY,
+    change_id TEXT NOT NULL REFERENCES admin_change_sets(change_id),
+    storage_id TEXT NOT NULL REFERENCES storage_containers(storage_id),
+    root_item_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    parent_item_id TEXT,
+    parent_index INTEGER CHECK(parent_index IS NULL OR parent_index >= 0),
+    tree_json JSONB NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_ms BIGINT NOT NULL,
+    restored_change_id TEXT,
+    restored_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS admin_quarantine_active ON admin_quarantine(created_ms DESC,quarantine_id) WHERE restored_ms IS NULL;
+
+CREATE TABLE IF NOT EXISTS admin_storage_snapshots(
+    snapshot_id TEXT PRIMARY KEY,
+    storage_id TEXT NOT NULL REFERENCES storage_containers(storage_id),
+    revision BIGINT NOT NULL CHECK(revision >= 0),
+    root_count INTEGER NOT NULL CHECK(root_count >= 0),
+    node_count BIGINT NOT NULL CHECK(node_count >= 0),
+    reason TEXT NOT NULL DEFAULT '',
+    admin_session_id TEXT NOT NULL,
+    windows_identity TEXT NOT NULL DEFAULT '',
+    created_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admin_storage_snapshots_history ON admin_storage_snapshots(storage_id,created_ms DESC,snapshot_id DESC);
+CREATE TABLE IF NOT EXISTS admin_snapshot_roots(
+    snapshot_id TEXT NOT NULL REFERENCES admin_storage_snapshots(snapshot_id) ON DELETE CASCADE,
+    root_item_id TEXT NOT NULL,
+    tree_json JSONB NOT NULL,
+    PRIMARY KEY(snapshot_id,root_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS admin_audit_events(
+    event_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    admin_session_id TEXT NOT NULL,
+    windows_identity TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    result TEXT NOT NULL CHECK(result IN ('SUCCESS','FAILURE')),
+    reason TEXT NOT NULL DEFAULT '',
+    error TEXT,
+    request_id TEXT NOT NULL,
+    change_id TEXT,
+    detail_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admin_audit_events_created ON admin_audit_events(created_ms DESC,event_id DESC);
+CREATE INDEX IF NOT EXISTS admin_audit_events_target ON admin_audit_events(target_type,target_id,created_ms DESC);
+
+CREATE TABLE IF NOT EXISTS players(
+    player_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    plain_name TEXT NOT NULL DEFAULT '',
+    full_name TEXT NOT NULL DEFAULT '',
+    last_session_player_id INTEGER,
+    last_ping_ms INTEGER CHECK(last_ping_ms IS NULL OR last_ping_ms >= 0),
+    last_bandwidth_kbps INTEGER CHECK(last_bandwidth_kbps IS NULL OR last_bandwidth_kbps >= 0),
+    last_output_throttle DOUBLE PRECISION CHECK(last_output_throttle IS NULL OR (last_output_throttle >= 0 AND last_output_throttle <= 1)),
+    last_map_name TEXT NOT NULL DEFAULT '',
+    last_position_x DOUBLE PRECISION,
+    last_position_y DOUBLE PRECISION,
+    last_position_z DOUBLE PRECISION,
+    first_seen_ms BIGINT NOT NULL,
+    last_seen_ms BIGINT NOT NULL,
+    last_snapshot_ms BIGINT,
+    last_inventory_count INTEGER NOT NULL DEFAULT 0 CHECK(last_inventory_count >= 0)
+) WITH (fillfactor=90);
+ALTER TABLE players ADD COLUMN IF NOT EXISTS plain_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE players ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_session_player_id INTEGER;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_ping_ms INTEGER;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_bandwidth_kbps INTEGER;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_output_throttle DOUBLE PRECISION;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_map_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_position_x DOUBLE PRECISION;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_position_y DOUBLE PRECISION;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_position_z DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS players_last_seen ON players(last_seen_ms DESC,player_id);
+CREATE INDEX IF NOT EXISTS players_name_prefix ON players((lower(display_name)) text_pattern_ops,player_id);
+
+CREATE TABLE IF NOT EXISTS player_aliases(
+    player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+    display_name TEXT NOT NULL,
+    first_seen_ms BIGINT NOT NULL,
+    last_seen_ms BIGINT NOT NULL,
+    PRIMARY KEY(player_id,display_name)
+);
+CREATE INDEX IF NOT EXISTS player_aliases_name_prefix ON player_aliases((lower(display_name)) text_pattern_ops,player_id);
+
+CREATE TABLE IF NOT EXISTS player_inventory_snapshots(
+    snapshot_id TEXT PRIMARY KEY,
+    player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+    captured_ms BIGINT NOT NULL,
+    item_count INTEGER NOT NULL CHECK(item_count >= 0),
+    profile_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    network_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    position_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    equipment_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    inventory_json JSONB NOT NULL CHECK(jsonb_typeof(inventory_json)='array')
+) WITH (autovacuum_vacuum_scale_factor=0.05, toast.autovacuum_vacuum_scale_factor=0.05);
+ALTER TABLE player_inventory_snapshots ADD COLUMN IF NOT EXISTS profile_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE player_inventory_snapshots ADD COLUMN IF NOT EXISTS network_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE player_inventory_snapshots ADD COLUMN IF NOT EXISTS position_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+CREATE INDEX IF NOT EXISTS player_inventory_snapshots_player
+    ON player_inventory_snapshots(player_id,captured_ms DESC,snapshot_id DESC);
+
+CREATE TABLE IF NOT EXISTS player_item_index(
+    snapshot_id TEXT NOT NULL REFERENCES player_inventory_snapshots(snapshot_id) ON DELETE CASCADE,
+    player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+    item_id TEXT NOT NULL,
+    parent_item_id TEXT,
+    depth INTEGER NOT NULL CHECK(depth >= 0),
+    class_name TEXT NOT NULL,
+    quantity DOUBLE PRECISION NOT NULL,
+    health DOUBLE PRECISION NOT NULL,
+    adapter_id TEXT NOT NULL,
+    location_type TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id,item_id)
+);
+CREATE INDEX IF NOT EXISTS player_item_index_player_class
+    ON player_item_index(player_id,(lower(class_name)) text_pattern_ops,snapshot_id,item_id);
+CREATE INDEX IF NOT EXISTS player_item_index_item
+    ON player_item_index(item_id,player_id,snapshot_id);
+CREATE INDEX IF NOT EXISTS player_item_index_class
+    ON player_item_index((lower(class_name)) text_pattern_ops,player_id,snapshot_id,item_id);
+
+CREATE TABLE IF NOT EXISTS player_events(
+    event_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    detail_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS player_events_player ON player_events(player_id,created_ms DESC,event_id DESC);
+CREATE INDEX IF NOT EXISTS player_events_created ON player_events(created_ms DESC,event_id DESC);
+
+CREATE TABLE IF NOT EXISTS admin_player_commands(
+    command_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    player_id TEXT NOT NULL REFERENCES players(player_id),
+    action TEXT NOT NULL CHECK(action IN ('REQUEST_SNAPSHOT','REMOVE_ITEM','GIVE_ITEM','REPAIR_ITEM','MOVE_ITEM','QUARANTINE_ITEM','RESTORE_QUARANTINE')),
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL CHECK(status IN ('PENDING','CLAIMED','SUCCEEDED','FAILED','EXPIRED')),
+    admin_session_id TEXT NOT NULL,
+    windows_identity TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_ms BIGINT NOT NULL,
+    expires_ms BIGINT NOT NULL,
+    claimed_ms BIGINT,
+    completed_ms BIGINT,
+    result_json JSONB,
+    error TEXT
+) WITH (fillfactor=90);
+CREATE INDEX IF NOT EXISTS admin_player_commands_pending
+    ON admin_player_commands(player_id,created_ms,command_id) WHERE status='PENDING';
+CREATE INDEX IF NOT EXISTS admin_player_commands_history
+    ON admin_player_commands(created_ms DESC,command_id DESC);
+
+CREATE TABLE IF NOT EXISTS player_quarantine(
+    quarantine_id TEXT PRIMARY KEY,
+    command_id TEXT NOT NULL REFERENCES admin_player_commands(command_id),
+    player_id TEXT NOT NULL REFERENCES players(player_id),
+    item_id TEXT NOT NULL,
+    tree_json JSONB NOT NULL,
+    created_ms BIGINT NOT NULL,
+    restored_command_id TEXT,
+    restored_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS player_quarantine_active
+    ON player_quarantine(created_ms DESC,quarantine_id) WHERE restored_ms IS NULL;
+
 CREATE TABLE IF NOT EXISTS legacy_imports(
     source_fingerprint TEXT PRIMARY KEY,
     source_path TEXT NOT NULL,
@@ -915,6 +1215,11 @@ json StorageDatabase::resolve_container(const json& request) {
     const auto provider_key = required_string(request, "provider_key", 512);
     const auto display_name = request.value("display_name", provider_key);
     const auto capacity = request.value("capacity_slots", 0LL);
+    const auto container_class = bounded_optional_string(request, "container_class", 256);
+    const auto map_name = bounded_optional_string(request, "map_name", 128);
+    const double position_x = optional_coordinate(request, "world_position_x");
+    const double position_y = optional_coordinate(request, "world_position_y");
+    const double position_z = optional_coordinate(request, "world_position_z");
     if (display_name.empty() || display_name.size() > 256 || capacity < 0 || capacity > 100000000) {
         throw ApiError(400, "invalid_request", "display_name or capacity_slots is invalid.");
     }
@@ -922,21 +1227,94 @@ json StorageDatabase::resolve_container(const json& request) {
     std::lock_guard lock(writer_gate_);
     Transaction transaction(writer_);
     const auto now = now_unix_ms();
-    Statement insert(writer_,
-        "INSERT INTO storage_containers(storage_id,provider_id,provider_key,display_name,capacity_slots,created_ms,updated_ms) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?6) ON CONFLICT(provider_id,provider_key) DO UPDATE SET "
-        "display_name=excluded.display_name,capacity_slots=excluded.capacity_slots,updated_ms=excluded.updated_ms "
-        "WHERE storage_containers.display_name<>excluded.display_name "
-        "OR storage_containers.capacity_slots<>excluded.capacity_slots");
-    insert.bind(1, random_hex(16)); insert.bind(2, provider_id); insert.bind(3, provider_key);
-    insert.bind(4, display_name); insert.bind(5, static_cast<std::int64_t>(capacity)); insert.bind(6, now); insert.done();
+    Statement insert(writer_, R"SQL(
+INSERT INTO storage_containers(
+    storage_id,provider_id,provider_key,display_name,capacity_slots,revision,
+    container_class,world_position_x,world_position_y,world_position_z,map_name,
+    first_seen_ms,last_seen_ms,created_ms,updated_ms
+)
+VALUES(?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10,?11,?11,?11,?11)
+ON CONFLICT(provider_id,provider_key) DO UPDATE SET
+    display_name=excluded.display_name,
+    capacity_slots=excluded.capacity_slots,
+    container_class=CASE WHEN excluded.container_class<>'' THEN excluded.container_class ELSE storage_containers.container_class END,
+    world_position_x=COALESCE(excluded.world_position_x,storage_containers.world_position_x),
+    world_position_y=COALESCE(excluded.world_position_y,storage_containers.world_position_y),
+    world_position_z=COALESCE(excluded.world_position_z,storage_containers.world_position_z),
+    map_name=CASE WHEN excluded.map_name<>'' THEN excluded.map_name ELSE storage_containers.map_name END,
+    first_seen_ms=COALESCE(storage_containers.first_seen_ms,excluded.first_seen_ms),
+    last_seen_ms=excluded.last_seen_ms,
+    updated_ms=excluded.updated_ms
+)SQL");
+    insert.bind(1, random_hex(16));
+    insert.bind(2, provider_id);
+    insert.bind(3, provider_key);
+    insert.bind(4, display_name);
+    insert.bind(5, static_cast<std::int64_t>(capacity));
+    insert.bind(6, container_class);
+    if (std::isnan(position_x)) insert.bind_null(7); else insert.bind(7, position_x);
+    if (std::isnan(position_y)) insert.bind_null(8); else insert.bind(8, position_y);
+    if (std::isnan(position_z)) insert.bind_null(9); else insert.bind(9, position_z);
+    insert.bind(10, map_name);
+    insert.bind(11, now);
+    insert.done();
+
     Statement query(writer_,
-        "SELECT storage_id,provider_id,provider_key,display_name,capacity_slots,revision,updated_ms "
+        "SELECT storage_id,provider_id,provider_key,display_name,capacity_slots,revision,updated_ms,"
+        "container_class,world_position_x,world_position_y,world_position_z,map_name,first_seen_ms,last_seen_ms "
         "FROM storage_containers WHERE provider_id=?1 AND provider_key=?2");
-    query.bind(1, provider_id); query.bind(2, provider_key); query.row();
+    query.bind(1, provider_id);
+    query.bind(2, provider_key);
+    if (!query.row()) throw std::runtime_error("Resolved storage container disappeared.");
     auto result = container_row(query);
+    result["container_class"] = query.text(7);
+    if (!query.is_null(8)) result["world_position_x"] = query.number(8);
+    if (!query.is_null(9)) result["world_position_y"] = query.number(9);
+    if (!query.is_null(10)) result["world_position_z"] = query.number(10);
+    result["map_name"] = query.text(11);
+    if (!query.is_null(12)) result["first_seen_ms"] = query.integer(12);
+    if (!query.is_null(13)) result["last_seen_ms"] = query.integer(13);
     transaction.commit();
     return result;
+}
+
+json StorageDatabase::observe_container(const json& request) {
+    const auto storage_id = required_string(request, "storage_id", 64);
+    const auto container_class = bounded_optional_string(request, "container_class", 256);
+    const auto map_name = bounded_optional_string(request, "map_name", 128);
+    const double position_x = optional_coordinate(request, "world_position_x");
+    const double position_y = optional_coordinate(request, "world_position_y");
+    const double position_z = optional_coordinate(request, "world_position_z");
+    const auto display_name = bounded_optional_string(request, "display_name", 256);
+    const auto now = now_unix_ms();
+
+    std::lock_guard lock(writer_gate_);
+    Transaction transaction(writer_);
+    Statement update(writer_, R"SQL(
+UPDATE storage_containers SET
+    display_name=CASE WHEN ?2<>'' THEN ?2 ELSE display_name END,
+    container_class=CASE WHEN ?3<>'' THEN ?3 ELSE container_class END,
+    world_position_x=COALESCE(?4,world_position_x),
+    world_position_y=COALESCE(?5,world_position_y),
+    world_position_z=COALESCE(?6,world_position_z),
+    map_name=CASE WHEN ?7<>'' THEN ?7 ELSE map_name END,
+    first_seen_ms=COALESCE(first_seen_ms,?8),
+    last_seen_ms=?8
+WHERE storage_id=?1
+RETURNING revision
+)SQL");
+    update.bind(1, storage_id);
+    update.bind(2, display_name);
+    update.bind(3, container_class);
+    if (std::isnan(position_x)) update.bind_null(4); else update.bind(4, position_x);
+    if (std::isnan(position_y)) update.bind_null(5); else update.bind(5, position_y);
+    if (std::isnan(position_z)) update.bind_null(6); else update.bind(6, position_z);
+    update.bind(7, map_name);
+    update.bind(8, now);
+    if (!update.row()) throw ApiError(404, "storage_not_found", "The storage container is not registered.");
+    const auto revision = update.integer(0);
+    transaction.commit();
+    return {{"storage_id", storage_id}, {"revision", revision}, {"last_seen_ms", now}};
 }
 
 json StorageDatabase::snapshot(const json& request) {
@@ -2034,6 +2412,28 @@ json StorageDatabase::quick_check() {
                    "SELECT storage_id,root_item_id,count(*) AS indexed_nodes FROM cargo_item_index GROUP BY storage_id,root_item_id"
                    ") i USING(storage_id,root_item_id) WHERE COALESCE(i.indexed_nodes,0)<>r.node_count");
     }
+    check_zero("player_snapshot_index_counts",
+               "SELECT count(*) FROM ("
+               "SELECT DISTINCT ON (player_id) snapshot_id,item_count FROM player_inventory_snapshots "
+               "ORDER BY player_id,captured_ms DESC,snapshot_id DESC"
+               ") s LEFT JOIN ("
+               "SELECT snapshot_id,count(*) AS indexed_nodes FROM player_item_index GROUP BY snapshot_id"
+               ") i USING(snapshot_id) WHERE COALESCE(i.indexed_nodes,0)<>s.item_count");
+    check_zero("invalid_player_telemetry",
+               "SELECT count(*) FROM players WHERE "
+               "(last_ping_ms IS NOT NULL AND last_ping_ms<0) OR "
+               "(last_bandwidth_kbps IS NOT NULL AND last_bandwidth_kbps<0) OR "
+               "(last_output_throttle IS NOT NULL AND (last_output_throttle<0 OR last_output_throttle>1)) OR "
+               "(last_position_x IS NOT NULL AND (last_position_y IS NULL OR last_position_z IS NULL)) OR "
+               "(last_position_y IS NOT NULL AND (last_position_x IS NULL OR last_position_z IS NULL)) OR "
+               "(last_position_z IS NOT NULL AND (last_position_x IS NULL OR last_position_y IS NULL))");
+    check_zero("invalid_player_snapshot_payloads",
+               "SELECT count(*) FROM player_inventory_snapshots WHERE "
+               "jsonb_typeof(profile_json)<>'object' OR jsonb_typeof(network_json)<>'object' OR "
+               "jsonb_typeof(position_json)<>'object' OR jsonb_typeof(equipment_json)<>'object' OR "
+               "jsonb_typeof(inventory_json)<>'array'");
+    check_zero("invalid_player_quarantine",
+               "SELECT count(*) FROM player_quarantine WHERE jsonb_typeof(tree_json)<>'object'");
     Statement app(slot.connection,
         "SELECT count(*) FROM application_meta WHERE key='application' AND value='ClippyVirtualCargo'");
     if (!app.row() || app.integer(0) != 1) {
@@ -2096,6 +2496,414 @@ json StorageDatabase::backup(const json&) {
             {"max_backup_files", config_.max_backup_files}, {"format", "pg_dump custom"}};
 }
 
+json StorageDatabase::verify_backup(const json& request) {
+    const auto filename = required_string(request, "filename", 128);
+    static const std::regex generated_name(R"(^ClippyVirtualCargo-[0-9]{10,20}-[0-9a-fA-F]{8}\.dump$)");
+    if (!std::regex_match(filename, generated_name)) {
+        throw ApiError(400, "invalid_backup", "Only Clippy-generated PostgreSQL backup filenames can be verified.");
+    }
+    const auto path = config_.backup_directory / filename;
+    if (!std::filesystem::is_regular_file(path)) {
+        throw ApiError(404, "backup_not_found", "The PostgreSQL backup file does not exist.");
+    }
+    const auto started = std::chrono::steady_clock::now();
+#ifdef _WIN32
+    if (config_.postgres_bin_directory.empty()) {
+        throw std::runtime_error("postgresBinDirectory is required for PostgreSQL backup verification.");
+    }
+    const auto restore = std::filesystem::path(config_.postgres_bin_directory) / "pg_restore.exe";
+    if (run_postgres_tool(restore, {L"--list", path.wstring()}, config_.postgres_password) != 0) {
+        throw ApiError(409, "backup_invalid", "pg_restore could not validate this PostgreSQL backup archive.");
+    }
+#else
+    throw std::runtime_error("PostgreSQL backup verification is currently packaged for the Windows DayZ server build.");
+#endif
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    return {{"filename", filename}, {"path", path.string()}, {"bytes", static_cast<std::int64_t>(std::filesystem::file_size(path))},
+            {"verified", true}, {"duration_ms", elapsed}, {"format", "pg_dump custom"}};
+}
+
+
+json StorageDatabase::player_snapshot(const json& request) {
+    const auto player_id = required_string(request, "player_id", 128);
+    const auto display_name = required_string(request, "display_name", 128);
+    if (!request.contains("inventory") || !request["inventory"].is_array()) {
+        throw ApiError(400, "invalid_player_snapshot", "inventory must be an array.");
+    }
+    json equipment = request.value("equipment", json::object());
+    json profile = request.value("profile", json::object());
+    json network = request.value("network", json::object());
+    json position = request.value("position", json::object());
+    if (!equipment.is_object() || !profile.is_object() || !network.is_object() || !position.is_object()) {
+        throw ApiError(400, "invalid_player_snapshot", "equipment, profile, network, and position must be objects.");
+    }
+    const auto plain_name = bounded_optional_string(profile, "plain_name", 128);
+    const auto full_name = bounded_optional_string(profile, "full_name", 256);
+    int session_player_id = -1;
+    if (profile.contains("session_player_id")) {
+        if (!profile["session_player_id"].is_number_integer()) {
+            throw ApiError(400, "invalid_player_snapshot", "session_player_id must be an integer.");
+        }
+        session_player_id = profile["session_player_id"].get<int>();
+    }
+    if (session_player_id < -1 || session_player_id > 1000000000) {
+        throw ApiError(400, "invalid_player_snapshot", "session_player_id is outside the supported range.");
+    }
+    const bool network_available = network.value("available", false);
+    if (network.contains("available") && !network["available"].is_boolean()) {
+        throw ApiError(400, "invalid_player_snapshot", "network.available must be boolean.");
+    }
+    auto network_int = [&](const char* key, int maximum) {
+        if (!network.contains(key)) return 0;
+        if (!network[key].is_number_integer()) throw ApiError(400, "invalid_player_snapshot", std::string("network.") + key + " must be an integer.");
+        const auto value = network[key].get<int>();
+        if (value < 0 || value > maximum) throw ApiError(400, "invalid_player_snapshot", std::string("network.") + key + " is outside the supported range.");
+        return value;
+    };
+    const int ping_act_ms = network_int("ping_act_ms", 600000);
+    const int ping_min_ms = network_int("ping_min_ms", 600000);
+    const int ping_max_ms = network_int("ping_max_ms", 600000);
+    const int ping_avg_ms = network_int("ping_avg_ms", 600000);
+    const int bandwidth_min_kbps = network_int("bandwidth_min_kbps", 1000000000);
+    const int bandwidth_max_kbps = network_int("bandwidth_max_kbps", 1000000000);
+    const int bandwidth_avg_kbps = network_int("bandwidth_avg_kbps", 1000000000);
+    (void)ping_act_ms; (void)ping_min_ms; (void)ping_max_ms;
+    (void)bandwidth_min_kbps; (void)bandwidth_max_kbps;
+    double output_throttle = network.value("output_throttle", 0.0);
+    if (!std::isfinite(output_throttle) || output_throttle < 0.0 || output_throttle > 1.0) {
+        throw ApiError(400, "invalid_player_snapshot", "network.output_throttle must be between 0 and 1.");
+    }
+    const bool position_available = position.value("available", false);
+    if (position.contains("available") && !position["available"].is_boolean()) {
+        throw ApiError(400, "invalid_player_snapshot", "position.available must be boolean.");
+    }
+    const auto player_map_name = bounded_optional_string(position, "map_name", 128);
+    if (position_available && (!position.contains("world_position_x") || !position.contains("world_position_y") || !position.contains("world_position_z"))) {
+        throw ApiError(400, "invalid_player_snapshot", "position coordinates are required when position telemetry is available.");
+    }
+    const double player_x = position_available ? optional_coordinate(position, "world_position_x") : std::numeric_limits<double>::quiet_NaN();
+    const double player_y = position_available ? optional_coordinate(position, "world_position_y") : std::numeric_limits<double>::quiet_NaN();
+    const double player_z = position_available ? optional_coordinate(position, "world_position_z") : std::numeric_limits<double>::quiet_NaN();
+    if (position_available && (std::isnan(player_x) || std::isnan(player_y) || std::isnan(player_z))) {
+        throw ApiError(400, "invalid_player_snapshot", "position coordinates must be finite numbers.");
+    }
+
+    std::size_t item_count = 0;
+    std::unordered_set<std::string> item_ids;
+    for (const auto& root : request["inventory"]) {
+        validate_telemetry_node(root, 0, item_count, item_ids, config_);
+    }
+    const auto now = now_unix_ms();
+    const auto snapshot_id = random_hex(16);
+
+    std::lock_guard lock(writer_gate_);
+    Transaction transaction(writer_);
+    Statement player(writer_, R"SQL(
+INSERT INTO players(
+    player_id,display_name,plain_name,full_name,last_session_player_id,last_ping_ms,last_bandwidth_kbps,
+    last_output_throttle,last_map_name,last_position_x,last_position_y,last_position_z,
+    first_seen_ms,last_seen_ms,last_snapshot_ms,last_inventory_count
+)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?13,?14)
+ON CONFLICT(player_id) DO UPDATE SET
+    display_name=excluded.display_name,
+    plain_name=excluded.plain_name,
+    full_name=excluded.full_name,
+    last_session_player_id=excluded.last_session_player_id,
+    last_ping_ms=excluded.last_ping_ms,
+    last_bandwidth_kbps=excluded.last_bandwidth_kbps,
+    last_output_throttle=excluded.last_output_throttle,
+    last_map_name=excluded.last_map_name,
+    last_position_x=excluded.last_position_x,
+    last_position_y=excluded.last_position_y,
+    last_position_z=excluded.last_position_z,
+    last_seen_ms=excluded.last_seen_ms,
+    last_snapshot_ms=excluded.last_snapshot_ms,
+    last_inventory_count=excluded.last_inventory_count
+)SQL");
+    player.bind(1, player_id);
+    player.bind(2, display_name);
+    player.bind(3, plain_name);
+    player.bind(4, full_name);
+    if (session_player_id >= 0) player.bind(5, session_player_id); else player.bind_null(5);
+    if (network_available) player.bind(6, ping_avg_ms); else player.bind_null(6);
+    if (network_available) player.bind(7, bandwidth_avg_kbps); else player.bind_null(7);
+    if (network_available) player.bind(8, output_throttle); else player.bind_null(8);
+    player.bind(9, position_available ? player_map_name : std::string{});
+    if (position_available) player.bind(10, player_x); else player.bind_null(10);
+    if (position_available) player.bind(11, player_y); else player.bind_null(11);
+    if (position_available) player.bind(12, player_z); else player.bind_null(12);
+    player.bind(13, now);
+    player.bind(14, static_cast<std::int64_t>(item_count));
+    player.done();
+
+    Statement alias(writer_, R"SQL(
+INSERT INTO player_aliases(player_id,display_name,first_seen_ms,last_seen_ms)
+VALUES(?1,?2,?3,?3)
+ON CONFLICT(player_id,display_name) DO UPDATE SET last_seen_ms=excluded.last_seen_ms
+)SQL");
+    alias.bind(1, player_id);
+    alias.bind(2, display_name);
+    alias.bind(3, now);
+    alias.done();
+
+    Statement snapshot(writer_, R"SQL(
+INSERT INTO player_inventory_snapshots(
+    snapshot_id,player_id,captured_ms,item_count,profile_json,network_json,position_json,equipment_json,inventory_json
+)
+VALUES(?1,?2,?3,?4,?5::jsonb,?6::jsonb,?7::jsonb,?8::jsonb,?9::jsonb)
+)SQL");
+    snapshot.bind(1, snapshot_id);
+    snapshot.bind(2, player_id);
+    snapshot.bind(3, now);
+    snapshot.bind(4, static_cast<std::int64_t>(item_count));
+    snapshot.bind(5, profile.dump());
+    snapshot.bind(6, network.dump());
+    snapshot.bind(7, position.dump());
+    snapshot.bind(8, equipment.dump());
+    snapshot.bind(9, request["inventory"].dump());
+    snapshot.done();
+
+    Statement index(writer_, R"SQL(
+INSERT INTO player_item_index(
+    snapshot_id,player_id,item_id,parent_item_id,depth,class_name,quantity,health,adapter_id,location_type
+)
+WITH RECURSIVE roots(node) AS (
+    SELECT value FROM jsonb_array_elements(?3::jsonb)
+),
+nodes(node,parent_item_id,depth) AS (
+    SELECT node,NULL::text,0 FROM roots
+    UNION ALL
+    SELECT child.value,nodes.node->>'item_id',nodes.depth+1
+    FROM nodes
+    CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(nodes.node->'children')='array' THEN nodes.node->'children' ELSE '[]'::jsonb END
+    ) child(value)
+)
+SELECT ?1,?2,node->>'item_id',parent_item_id,depth,node->>'class_name',
+       COALESCE((node->>'quantity')::double precision,0),
+       COALESCE((node->>'health')::double precision,0),
+       COALESCE(node#>>'{adapter,id}',''),
+       COALESCE(node#>>'{location,kind}','')
+FROM nodes
+WHERE jsonb_typeof(node)='object' AND node ? 'item_id' AND node ? 'class_name'
+)SQL");
+    index.bind(1, snapshot_id);
+    index.bind(2, player_id);
+    index.bind(3, request["inventory"].dump());
+    index.done();
+
+    // Keep historical snapshot JSON for compare/export, but keep the derived
+    // searchable index only for this player's latest snapshot.
+    Statement prune_old_index(writer_,
+        "DELETE FROM player_item_index WHERE player_id=?1 AND snapshot_id<>?2");
+    prune_old_index.bind(1, player_id);
+    prune_old_index.bind(2, snapshot_id);
+    prune_old_index.done();
+
+    Statement prune_snapshot_history(writer_, R"SQL(
+DELETE FROM player_inventory_snapshots WHERE snapshot_id IN (
+    SELECT snapshot_id FROM player_inventory_snapshots
+    WHERE player_id=?1
+    ORDER BY captured_ms DESC,snapshot_id DESC
+    OFFSET ?2 LIMIT ?3
+)
+)SQL");
+    prune_snapshot_history.bind(1, player_id);
+    prune_snapshot_history.bind(2, static_cast<std::int64_t>(config_.player_snapshot_history_limit));
+    prune_snapshot_history.bind(3, static_cast<std::int64_t>(config_.maintenance_prune_batch_rows));
+    prune_snapshot_history.done();
+
+    Statement event(writer_,
+        "INSERT INTO player_events(player_id,event_type,detail_json,created_ms) VALUES(?1,'SNAPSHOT',?2::jsonb,?3)");
+    event.bind(1, player_id);
+    event.bind(2, json{{"snapshot_id",snapshot_id},{"item_count",item_count},
+                       {"ping_avg_ms",network_available ? json(ping_avg_ms) : json(nullptr)},
+                       {"bandwidth_avg_kbps",network_available ? json(bandwidth_avg_kbps) : json(nullptr)},
+                       {"map_name",position_available ? json(player_map_name) : json(nullptr)}}.dump());
+    event.bind(3, now);
+    event.done();
+
+    transaction.commit();
+    return {{"snapshot_id", snapshot_id}, {"player_id", player_id},
+            {"captured_ms", now}, {"item_count", static_cast<std::int64_t>(item_count)}};
+}
+
+json StorageDatabase::poll_player_commands(const json& request) {
+    const auto player_id = required_string(request, "player_id", 128);
+    const int limit = std::clamp(request.value("limit", 4), 1, 10);
+    const auto now = now_unix_ms();
+
+    std::lock_guard lock(writer_gate_);
+    Transaction transaction(writer_);
+    Statement expire_pending(writer_,
+        "UPDATE admin_player_commands SET status='EXPIRED',completed_ms=?1,error='Command expired before DayZ claimed it.' "
+        "WHERE status='PENDING' AND expires_ms<=?1");
+    expire_pending.bind(1, now);
+    expire_pending.done();
+    Statement expire_claimed(writer_,
+        "UPDATE admin_player_commands SET status='EXPIRED',completed_ms=?1,error='Command result was not returned before the claim timeout.' "
+        "WHERE status='CLAIMED' AND expires_ms+120000<=?1");
+    expire_claimed.bind(1, now);
+    expire_claimed.done();
+
+    Statement query(writer_, R"SQL(
+SELECT command_id,action,payload_json::text,expires_ms
+FROM admin_player_commands
+WHERE player_id=?1 AND status='PENDING' AND expires_ms>?2
+ORDER BY created_ms,command_id
+FOR UPDATE SKIP LOCKED
+LIMIT ?3
+)SQL");
+    query.bind(1, player_id);
+    query.bind(2, now);
+    query.bind(3, static_cast<std::int64_t>(limit));
+    json commands = json::array();
+    std::vector<std::string> claimed;
+    while (query.row()) {
+        commands.push_back({
+            {"command_id", query.text(0)},
+            {"action", query.text(1)},
+            {"payload_json", query.text(2)},
+            {"expires_ms", query.integer(3)}
+        });
+        claimed.push_back(query.text(0));
+    }
+    Statement claim(writer_,
+        "UPDATE admin_player_commands SET status='CLAIMED',claimed_ms=?2 WHERE command_id=?1 AND status='PENDING'");
+    for (const auto& command_id : claimed) {
+        claim.bind(1, command_id);
+        claim.bind(2, now);
+        claim.done();
+        claim.reset();
+    }
+    if (!claimed.empty()) {
+        Statement seen(writer_, "UPDATE players SET last_seen_ms=?2 WHERE player_id=?1");
+        seen.bind(1, player_id);
+        seen.bind(2, now);
+        seen.done();
+    }
+    transaction.commit();
+    return {{"player_id", player_id}, {"commands", std::move(commands)}, {"server_ms", now}};
+}
+
+json StorageDatabase::complete_player_command(const json& request) {
+    const auto command_id = required_string(request, "command_id", 64);
+    const auto player_id = required_string(request, "player_id", 128);
+    const auto status = required_string(request, "status", 16);
+    if (status != "SUCCEEDED" && status != "FAILED") {
+        throw ApiError(400, "invalid_command_status", "Player command status must be SUCCEEDED or FAILED.");
+    }
+    const auto error = bounded_optional_string(request, "error", 1024);
+    const auto result_text = bounded_optional_string(request, "result_json", 512 * 1024);
+    json result = json::object();
+    if (!result_text.empty()) {
+        try {
+            result = json::parse(result_text);
+        } catch (...) {
+            throw ApiError(400, "invalid_command_result", "result_json must contain valid JSON.");
+        }
+    }
+    const auto now = now_unix_ms();
+
+    std::lock_guard lock(writer_gate_);
+    Transaction transaction(writer_);
+    Statement current(writer_, R"SQL(
+SELECT action,status,payload_json::text,admin_session_id,windows_identity,request_id,reason
+FROM admin_player_commands
+WHERE command_id=?1 AND player_id=?2
+FOR UPDATE
+)SQL");
+    current.bind(1, command_id);
+    current.bind(2, player_id);
+    if (!current.row()) throw ApiError(404, "command_not_found", "The player command does not exist.");
+    const auto action = current.text(0);
+    const auto current_status = current.text(1);
+    const auto payload = json::parse(current.text(2));
+    const auto admin_session_id = current.text(3);
+    const auto windows_identity = current.text(4);
+    const auto request_id = current.text(5);
+    const auto reason = current.text(6);
+    if (current_status == "SUCCEEDED" || current_status == "FAILED") {
+        transaction.commit();
+        return {{"command_id",command_id},{"status",current_status},{"already_completed",true}};
+    }
+    if (current_status != "CLAIMED") {
+        throw ApiError(409, "command_not_claimed", "This player command is not in a claimable completion state.", true);
+    }
+
+    Statement update(writer_, R"SQL(
+UPDATE admin_player_commands
+SET status=?2,completed_ms=?3,result_json=?4::jsonb,error=?5
+WHERE command_id=?1
+)SQL");
+    update.bind(1, command_id);
+    update.bind(2, status);
+    update.bind(3, now);
+    update.bind(4, result.dump());
+    if (error.empty()) update.bind_null(5); else update.bind(5, error);
+    update.done();
+
+    if (status == "SUCCEEDED" && action == "QUARANTINE_ITEM" &&
+        result.contains("item_tree") && result["item_tree"].is_object()) {
+        const auto item_id = result["item_tree"].value("item_id", "");
+        if (!item_id.empty()) {
+            Statement quarantine(writer_, R"SQL(
+INSERT INTO player_quarantine(quarantine_id,command_id,player_id,item_id,tree_json,created_ms)
+VALUES(?1,?1,?2,?3,?4::jsonb,?5)
+ON CONFLICT(quarantine_id) DO NOTHING
+)SQL");
+            quarantine.bind(1, command_id);
+            quarantine.bind(2, player_id);
+            quarantine.bind(3, item_id);
+            quarantine.bind(4, result["item_tree"].dump());
+            quarantine.bind(5, now);
+            quarantine.done();
+        }
+    }
+    if (status == "SUCCEEDED" && action == "RESTORE_QUARANTINE") {
+        const auto quarantine_id = payload.value("quarantine_id", "");
+        if (!quarantine_id.empty()) {
+            Statement restored(writer_,
+                "UPDATE player_quarantine SET restored_command_id=?2,restored_ms=?3 "
+                "WHERE quarantine_id=?1 AND restored_ms IS NULL");
+            restored.bind(1, quarantine_id);
+            restored.bind(2, command_id);
+            restored.bind(3, now);
+            restored.done();
+        }
+    }
+
+    Statement event(writer_,
+        "INSERT INTO player_events(player_id,event_type,detail_json,created_ms) VALUES(?1,?2,?3::jsonb,?4)");
+    event.bind(1, player_id);
+    event.bind(2, std::string(status == "SUCCEEDED" ? "COMMAND_SUCCEEDED" : "COMMAND_FAILED"));
+    event.bind(3, json{{"command_id",command_id},{"action",action},{"error",error}}.dump());
+    event.bind(4, now);
+    event.done();
+
+    Statement audit(writer_, R"SQL(
+INSERT INTO admin_audit_events(
+    admin_session_id,windows_identity,action,target_type,target_id,result,reason,error,
+    request_id,change_id,detail_json,created_ms
+) VALUES(?1,?2,'player_command_result','player',?3,?4,?5,?6,?7,NULL,?8::jsonb,?9)
+)SQL");
+    audit.bind(1, admin_session_id);
+    audit.bind(2, windows_identity);
+    audit.bind(3, player_id);
+    audit.bind(4, std::string(status == "SUCCEEDED" ? "SUCCESS" : "FAILURE"));
+    audit.bind(5, reason);
+    if (error.empty()) audit.bind_null(6); else audit.bind(6, error);
+    audit.bind(7, request_id);
+    audit.bind(8, json{{"command_id",command_id},{"command_action",action},{"command_status",status}}.dump());
+    audit.bind(9, now);
+    audit.done();
+
+    transaction.commit();
+    return {{"command_id", command_id}, {"status", status}, {"completed_ms", now}};
+}
+
 json StorageDatabase::metrics(const json& request) {
     const auto provider_id = required_string(request, "provider_id", 128);
     auto& slot = reader();
@@ -2147,8 +2955,13 @@ void StorageDatabase::optimize() {
 }
 
 void StorageDatabase::prune_terminal_history() {
-    const auto cutoff = now_unix_ms() -
+    const auto now = now_unix_ms();
+    const auto cutoff = now -
         static_cast<std::int64_t>(config_.terminal_retention_days) * 24 * 60 * 60 * 1000;
+    const auto player_cutoff = now -
+        static_cast<std::int64_t>(config_.player_telemetry_retention_days) * 24 * 60 * 60 * 1000;
+    const auto admin_cutoff = now -
+        static_cast<std::int64_t>(config_.admin_audit_retention_days) * 24 * 60 * 60 * 1000;
     const auto batch = static_cast<std::int64_t>(config_.maintenance_prune_batch_rows);
     std::lock_guard lock(writer_gate_);
     Transaction transaction(writer_);
@@ -2186,6 +2999,54 @@ DELETE FROM cargo_sessions WHERE session_id IN (
     ORDER BY updated_ms,session_id LIMIT ?2
 ))SQL");
     session_delete.bind(1, cutoff); session_delete.bind(2, batch); session_delete.done();
+
+    Statement player_event_delete(writer_, R"SQL(
+DELETE FROM player_events WHERE event_id IN (
+    SELECT event_id FROM player_events WHERE created_ms<?1 ORDER BY event_id LIMIT ?2
+))SQL");
+    player_event_delete.bind(1, player_cutoff); player_event_delete.bind(2, batch); player_event_delete.done();
+
+    Statement player_snapshot_delete(writer_, R"SQL(
+DELETE FROM player_inventory_snapshots WHERE snapshot_id IN (
+    SELECT snapshot_id FROM player_inventory_snapshots WHERE captured_ms<?1
+    ORDER BY captured_ms,snapshot_id LIMIT ?2
+))SQL");
+    player_snapshot_delete.bind(1, player_cutoff); player_snapshot_delete.bind(2, batch); player_snapshot_delete.done();
+
+    Statement alias_delete(writer_, R"SQL(
+DELETE FROM player_aliases WHERE (player_id,display_name) IN (
+    SELECT a.player_id,a.display_name FROM player_aliases a
+    JOIN players p ON p.player_id=a.player_id
+    WHERE a.last_seen_ms<?1 AND a.display_name<>p.display_name
+    ORDER BY a.last_seen_ms,a.player_id,a.display_name LIMIT ?2
+)
+)SQL");
+    alias_delete.bind(1, player_cutoff); alias_delete.bind(2, batch); alias_delete.done();
+
+    Statement admin_audit_delete(writer_, R"SQL(
+DELETE FROM admin_audit_events WHERE event_id IN (
+    SELECT event_id FROM admin_audit_events WHERE created_ms<?1
+    ORDER BY created_ms,event_id LIMIT ?2
+)
+)SQL");
+    admin_audit_delete.bind(1, admin_cutoff); admin_audit_delete.bind(2, batch); admin_audit_delete.done();
+
+    Statement command_delete(writer_, R"SQL(
+DELETE FROM admin_player_commands WHERE command_id IN (
+    SELECT c.command_id FROM admin_player_commands c
+    WHERE c.created_ms<?1 AND c.status IN ('SUCCEEDED','FAILED','EXPIRED')
+      AND NOT EXISTS(SELECT 1 FROM player_quarantine q WHERE q.command_id=c.command_id OR q.restored_command_id=c.command_id)
+    ORDER BY c.created_ms,c.command_id LIMIT ?2
+)
+)SQL");
+    command_delete.bind(1, admin_cutoff); command_delete.bind(2, batch); command_delete.done();
+
+    Statement command_expire(writer_, R"SQL(
+UPDATE admin_player_commands
+SET status='EXPIRED',completed_ms=?1,error=COALESCE(error,'Command expired during maintenance.')
+WHERE status IN ('PENDING','CLAIMED') AND expires_ms<?1
+)SQL");
+    command_expire.bind(1, now); command_expire.done();
 
     // cargo_migrations and cargo_migration_roots are permanent dedupe
     // tombstones. Deleting them could let a rolled-back DayZ hive resurrect and
