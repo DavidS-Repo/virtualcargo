@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.2
+
+- Fixed item-based virtual cargo containers that could materialize and display stored items while native container rules still blocked dragging items out or putting items back.
+- `Open virtual cargo` now requires an item-based container to be natively open. Lockable or ownership-controlled storage must be unlocked/opened through its normal mod actions first.
+- Clippy never calls a third-party container's `Open()` method to force access, so the compatibility fix does not intentionally bypass native locks or ownership checks.
+- Added a post-materialization native cargo probe. If the container still rejects receive/release interaction, Clippy deletes the temporary materialized page and aborts the OPEN session instead of leaving an immovable inventory visible.
+- Active virtual pages now auto-save if an item-based container becomes closed or locked while the page is open.
+- Rebuilt and re-signed the DayZ Workshop PBO as 1.0.2 with the existing `ClippyVirtualCargo_0_1` signing identity.
+- Kept ClippyAdminHost at 1.0.1, ClippyStorageHost at 1.0.0, PostgreSQL schema at 11, and ClippyServerManager at revision 21 because those components do not require code changes for this fix.
+
 ## 1.0.1
 
 - Added clickable sortable table headers across the Admin Panel. Numeric, date/time, text, and DayZ position columns use column-appropriate ordering, with ascending/descending state shown in the header. Sorting applies to the currently loaded page.

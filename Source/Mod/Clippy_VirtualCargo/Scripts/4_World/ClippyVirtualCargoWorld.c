@@ -605,6 +605,27 @@ class CVCContainerPolicy
             return false;
         return true;
     }
+
+    // Item-based containers can have their own open, lock, ownership, or door state.
+    // ItemBase itself reports IsOpen() == true, so this only blocks subclasses that
+    // deliberately expose a closed state. Clippy never calls Open() here because doing
+    // that directly could bypass another mod's normal unlock/access action.
+    static bool IsNativeInteractionReady(EntityAI entity)
+    {
+        ItemBase item = ItemBase.Cast(entity);
+        if (!item)
+            return true;
+        return item.IsOpen();
+    }
+
+    static bool CheckNativeInteractionReady(EntityAI entity, out string reason)
+    {
+        reason = "";
+        if (IsNativeInteractionReady(entity))
+            return true;
+        reason = "open or unlock this container normally before opening virtual cargo";
+        return false;
+    }
 }
 
 class CVCContainerRuntime
@@ -1286,6 +1307,13 @@ class CVCContainerService
             }
         }
         state.internal_mutation = false;
+        string nativeInteractionError;
+        if (!ValidateNativeMaterializedInteraction(state, nativeInteractionError))
+        {
+            AbortOpening(state, nativeInteractionError);
+            ScheduleMaterializationPump();
+            return;
+        }
         job.journal.status = "MARK_PENDING";
         foreach (string markRootID : state.pending_mark_root_ids)
             job.journal.mark_root_ids.Insert(markRootID);
@@ -1518,6 +1546,13 @@ class CVCContainerService
     {
         if (!ClippyVirtualCargoAPI.IsReady() || !CanOpen(container) || !CVCContainerPolicy.CanAccess(container, player))
             return;
+        string nativeInteractionError;
+        if (!CVCContainerPolicy.CheckNativeInteractionReady(container, nativeInteractionError))
+        {
+            if (player)
+                player.MessageStatus("Virtual cargo: " + nativeInteractionError + ".");
+            return;
+        }
         CVCContainerRuntime state = State(container);
         if (!state)
             return;
@@ -1586,6 +1621,49 @@ class CVCContainerService
             if (item && !CVCItemTreeCodec.CanCaptureTree(item, reason))
                 return false;
         }
+        return true;
+    }
+
+    // Validate real container/item interaction rules after the virtual page has been
+    // rebuilt but before the host is told materialization succeeded. Clippy's own
+    // temporary physical-cargo guard is suspended for this probe; third-party rules
+    // still execute. A failed probe aborts and cleans the temporary physical page.
+    static bool ValidateNativeMaterializedInteraction(CVCContainerRuntime state, out string reason)
+    {
+        reason = "";
+        if (!state || !state.container)
+        {
+            reason = "container interaction state is unavailable";
+            return false;
+        }
+
+        string nativeInteractionError;
+        if (!CVCContainerPolicy.CheckNativeInteractionReady(state.container, nativeInteractionError))
+        {
+            reason = nativeInteractionError;
+            return false;
+        }
+
+        bool previousInternalMutation = state.internal_mutation;
+        state.internal_mutation = true;
+        foreach (ItemBase root : state.materialized)
+        {
+            if (!root || root.GetHierarchyParent() != state.container)
+                continue;
+            if (!state.container.CanReleaseCargo(root) || !root.CanRemoveFromCargo(state.container))
+            {
+                state.internal_mutation = previousInternalMutation;
+                reason = "native container rules block removing materialized cargo; open or unlock the container normally, or exclude this container class from virtual cargo";
+                return false;
+            }
+            if (!state.container.CanReceiveItemIntoCargo(root) || !root.CanPutInCargo(state.container))
+            {
+                state.internal_mutation = previousInternalMutation;
+                reason = "native container rules block returning cargo; open or unlock the container normally, or exclude this container class from virtual cargo";
+                return false;
+            }
+        }
+        state.internal_mutation = previousInternalMutation;
         return true;
     }
 
@@ -2408,7 +2486,15 @@ class CVCContainerService
             if (!state || !state.container)
                 continue;
             if (state.phase == PHASE_ACTIVE && (!state.player || !CVCContainerPolicy.CanAccess(state.container, state.player)))
+            {
                 Commit(state);
+            }
+            else if (state.phase == PHASE_ACTIVE && !CVCContainerPolicy.IsNativeInteractionReady(state.container))
+            {
+                if (state.player)
+                    state.player.MessageStatus("Virtual cargo is closing because the container was closed or locked.");
+                Commit(state);
+            }
             if (state.storage_id != "" && (state.last_metadata_report_ms == 0 || nowMs - state.last_metadata_report_ms >= 60000))
                 CVCContainerMetadata.Observe(state);
         }
@@ -3193,8 +3279,8 @@ class ActionCVCOpenNativeCargo: ActionSingleUseBase
     {
         EntityAI container = EntityAI.Cast(target.GetObject());
         if (!GetGame().IsServer())
-            return !item && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.CanOpen(container);
-        return !item && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.CanOpen(container);
+            return !item && CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.CanOpen(container);
+        return !item && CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.CanOpen(container);
     }
     override void OnExecuteServer(ActionData action_data)
     {
@@ -3214,8 +3300,8 @@ class ActionCVCOpenNextPage: ActionSingleUseBase
     {
         EntityAI container = EntityAI.Cast(target.GetObject());
         if (!GetGame().IsServer())
-            return !item && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.HasNextPage(container);
-        return !item && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.HasNextPage(container);
+            return !item && CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.HasNextPage(container);
+        return !item && CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.HasNextPage(container);
     }
     override void OnExecuteServer(ActionData action_data)
     {
