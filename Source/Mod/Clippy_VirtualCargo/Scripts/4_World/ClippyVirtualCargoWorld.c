@@ -4133,19 +4133,33 @@ modded class CarScript
 
 modded class PlayerBase
 {
+    // 4_World cannot reference classes declared by the later 5_Mission module.
+    // Store the server reply here and let the mission layer consume it on the client.
+    protected int m_CVCInventoryOpenResponse;
+
+    int CVCConsumeInventoryOpenResponse()
+    {
+        int response = m_CVCInventoryOpenResponse;
+        m_CVCInventoryOpenResponse = 0;
+        return response;
+    }
+
     override void OnRPC(PlayerIdentity sender, int rpc_type, ParamsReadContext ctx)
     {
         super.OnRPC(sender, rpc_type, ctx);
         if (rpc_type == CVCRPC.OPEN_INVENTORY && GetGame().IsClient())
         {
             Param1<string> openData;
-            MissionGameplay mission = MissionGameplay.Cast(GetGame().GetMission());
-            if (ctx.Read(openData) && mission)
+            if (ctx.Read(openData))
             {
                 if (openData.param1 == "native")
-                    mission.CVCShowInventoryApproved();
+                    m_CVCInventoryOpenResponse = 1;
                 else
-                    mission.CVCCancelInventoryOpen();
+                    m_CVCInventoryOpenResponse = -1;
+            }
+            else
+            {
+                m_CVCInventoryOpenResponse = -1;
             }
         }
         else if (rpc_type == CVCRPC.INVENTORY_OPEN && GetGame().IsServer())

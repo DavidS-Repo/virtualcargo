@@ -703,6 +703,21 @@ modded class MissionGameplay
         m_CVCInventoryOpenApproved = false;
     }
 
+    override void OnUpdate(float timeslice)
+    {
+        super.OnUpdate(timeslice);
+
+        PlayerBase player = PlayerBase.Cast(GetGame().GetPlayer());
+        if (!player)
+            return;
+
+        int response = player.CVCConsumeInventoryOpenResponse();
+        if (response > 0)
+            CVCShowInventoryApproved();
+        else if (response < 0)
+            CVCCancelInventoryOpen();
+    }
+
     override void ShowInventory()
     {
         if (m_CVCInventoryOpenApproved)
