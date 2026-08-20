@@ -1,193 +1,173 @@
 # Clippy Virtual Cargo
 
-Clippy Virtual Cargo stores selected DayZ container contents in a private local PostgreSQL database while virtual cargo is closed. Items return to DayZ when a player opens the container and are committed back through Clippy's revision, session, migration, cleanup, and locking workflow.
+Clippy Virtual Cargo is a DayZ server mod that moves eligible container contents out of the live game world while the container is closed. The physical container stays in DayZ. Its stored items are kept in a private PostgreSQL database until a player opens the container again.
 
-Version 1.0.3 is a DayZ-side portable-container pickup and action-targeting fix. Idle clothing, backpacks, bags, barrels, and other item-based cargo containers can use normal DayZ pickup-to-hands behavior again. Clippy container actions now use the interaction input group and are only attached to cargo-capable items, so medicine and other ordinary held items keep their normal target-player actions. Clippy still locks movement while virtual cargo is opening, saving, recovering, or migrating. ClippyAdminHost remains at 1.0.1, ClippyStorageHost remains at 1.0.0, and PostgreSQL schema 11 is unchanged.
+The project is built for persistent servers with large amounts of stored loot. Closed virtual cargo no longer exists as normal DayZ item entities that must remain loaded, persisted, and networked.
 
-## Version split
+This is container storage, not a player bank or shared account system.
 
-- Clippy Virtual Cargo release: 1.0.3
-- ClippyAdminHost: 1.0.1
-- ClippyStorageHost: 1.0.0
-- Signed DayZ Workshop payload: 1.0.3
-- PostgreSQL schema: 11
-- ClippyServerManager revision: 21
+## How it works
 
-This split is intentional. Version 1.0.3 changes the DayZ mod source and requires the new signed 1.0.3 PBO. The native hosts and database schema do not change.
+When an eligible container is closed, Clippy captures its cargo tree and stores it in PostgreSQL. Item roots include attachments and nested cargo.
 
-## Install or upgrade
+When a player opens virtual cargo, Clippy rebuilds a bounded page of those items inside the real DayZ container. The player uses normal DayZ inventory controls while that page is open. Closing inventory, leaving range, disconnecting, or ending the session commits the page back to storage.
 
-1. Stop the DayZ server before replacing server-side Clippy files.
-2. Download the 1.0.3 Server Ready or GitHub Ready package.
-3. Extract it into the folder that contains `DayZServer_x64.exe` and allow the Clippy server-side files to be replaced.
-4. Keep your existing `ClippyServerManager.json`. The manager preserves it and adds missing settings with defaults.
-5. Run `START-CLIPPY-SERVER.bat`.
-6. Run `OPEN-CLIPPY-ADMIN.bat` when you want the local Admin Panel.
+Only one active virtual-cargo session can control the same container at a time.
 
-For a new installation, review `ClippyServerManager.example.json` if you need custom launch, virtual-cargo, Admin Panel, telemetry, retention, or live-control settings.
+## Container scope
 
-PostgreSQL stays on `127.0.0.1:27816` by default. ClippyStorageHost stays on `127.0.0.1:27815`. ClippyAdminHost stays on `127.0.0.1:27817`.
+Fresh installations can automatically discover compatible top-level entities with cargo storage. Inherited container classes and vehicle cargo are supported by the default configuration.
 
-## Portable container pickup in 1.0.3
+Players are never treated as virtual cargo containers.
 
-Clippy now separates a container being managed from a container being unsafe to move. Idle portable storage can be picked up normally when DayZ allows it. A separate movement lock is used only while Clippy has an active open, save, recovery, or migration workflow for that container.
+Servers can disable automatic discovery and use an explicit class list. Classes with custom locks, ownership rules, machines, remote storage, or unusual inventory behavior can be excluded with `ExcludedContainerClassNames`.
 
-## Container interaction compatibility in 1.0.2
+The default exclusions include:
 
-Item-based storage can impose its own open, lock, ownership, door, or cargo rules. Clippy now requires an item-based container to be in its normal native open state before `Open virtual cargo` is available. Clippy does not call a container's `Open()` method itself, so another mod's unlock or access action is not bypassed.
+- `ClippyVirtualCargoQuarantine`
+- `FireplaceBase`
 
-After a virtual page is rebuilt, Clippy probes the container's real cargo receive/release rules while suspending only Clippy's own temporary physical-cargo guard. If the native rules still reject the materialized items, Clippy removes the temporary page and aborts the OPEN session instead of showing cargo that cannot be moved.
+## Item state
 
-For lockable third-party storage, unlock and open the container normally first, then use `Open virtual cargo`. A container class whose native rules still reject cargo interaction while open should be excluded or integrated with a dedicated compatibility adapter.
+The built-in DayZ item adapter stores common item state, including:
+
+- Class and quantity
+- Global and damage-zone health
+- Wetness and temperature
+- Liquids, energy, and food stage
+- Magazine cartridges
+- Weapon chambers and internal magazines
+- Attachments
+- Nested cargo and cargo locations
+
+Items with private class-specific state need dedicated adapter support if that state must survive virtualization. Mods can register a `CVCWorldItemAdapter` for their own item classes.
+
+Unsafe item trees fail closed instead of being partly removed from DayZ. Default safety rules reject cases such as contaminated items, active or plugged energy items, explosives, and traps when their state cannot be restored safely.
+
+## Player use
+
+Aim at an enabled container and use the Clippy virtual-cargo action when it is available.
+
+Large inventories are loaded in pages. Clippy provides actions for opening the next page and retrying a failed save.
+
+Native DayZ container rules still apply. Lockable or openable containers must satisfy their normal access rules before Clippy exposes stored cargo.
+
+## Server companion
+
+The Workshop mod requires the Clippy server companion on the DayZ server machine. The companion includes:
+
+- `ClippyServerManager.ps1`
+- `ClippyStorageHost.exe`
+- `ClippyAdminHost.exe`
+- PostgreSQL setup and migration support
+- Backup, restore, recovery, and integrity tools
+- Default server-side configuration
+
+`START-CLIPPY-SERVER.bat` starts the managed server stack.
+
+`OPEN-CLIPPY-ADMIN.bat` opens the local Admin Panel.
+
+## Installation
+
+1. Install or subscribe to the Clippy Virtual Cargo Workshop mod.
+2. Download the matching Server Ready package from GitHub Releases.
+3. Stop the DayZ server.
+4. Extract the Server Ready package into the folder containing `DayZServer_x64.exe`.
+5. Run `START-CLIPPY-SERVER.bat` as Administrator.
+6. Keep the generated `ClippyServerManager.json` for future updates.
+
+The manager creates missing configuration with defaults and preserves existing settings during updates.
+
+Players only need the Workshop mod. PostgreSQL and the Clippy server hosts run on the server machine.
+
+## Configuration
+
+`ClippyServerManager.json` controls DayZ launch settings, container discovery, exclusions, Admin Panel settings, telemetry, retention, and optional live player controls.
+
+See `ClippyServerManager.example.json` for the supported structure.
+
+Default local service ports are:
+
+- ClippyStorageHost: `127.0.0.1:27815`
+- PostgreSQL: `127.0.0.1:27816`
+- ClippyAdminHost: `127.0.0.1:27817`
+
+These services are intended to remain private to the server machine.
 
 ## Admin Panel
 
-The local Admin Panel includes Overview, Containers, Items, Activity, Sessions, Recovery, Maintenance, Backups, Quarantine, Audit Log, Database, Reports, Players, Settings, and Ctrl+K navigation/search.
+The local Admin Panel provides views and tools for:
 
-Version 1.0.1 changes the day-to-day admin workflow:
+- Virtual cargo containers and nested inventories
+- Stored item search
+- Active sessions and recovery state
+- Maintenance locks
+- Quarantine
+- Snapshots and change history
+- Audit and activity history
+- Database status and integrity checks
+- Backups
+- Reports
+- Optional player telemetry
+- Optional live player inventory controls
 
-- Table headers are clickable sort controls. Loaded rows can be sorted ascending or descending with numeric, date/time, text, or DayZ-position ordering as appropriate for the column.
-- Container, item, activity, audit, and player filters now use the same submit model. Click Search or press Enter to run the query.
-- Item search no longer runs after every typed character or steals input focus.
-- Opening Items with a blank query browses the first bounded page of indexed virtual cargo.
-- Filterable pages include Clear controls.
-- Containers includes a `Has virtual cargo` shortcut for hiding discovered containers with zero stored nodes.
-- The Ctrl+K box documents its global search prefixes instead of looking like a second copy of each page's local filter box.
+Stored-cargo edits use revision checks, maintenance locks, PostgreSQL transactions, audit records, and recoverable before-state data.
 
-Sorting applies to the rows currently loaded in the browser. Database queries remain bounded rather than loading every row only to sort it client-side.
-
-## Settings page
-
-Version 1.0.1 can write a fixed allowlist of server-owner settings back to the real `ClippyServerManager.json` from the local Settings page.
-
-Editable groups include Admin Panel state and limits, PostgreSQL read/write pool settings and timeouts, maintenance-lock duration, player telemetry, network and position telemetry, snapshot interval, telemetry retention, audit retention, live player controls, command polling, and command expiry.
-
-The page does not expose PostgreSQL passwords, Clippy service tokens, signing keys, executable paths, PostgreSQL installation paths, or arbitrary JSON fields.
-
-Settings changes use these safeguards:
-
-- Apply stays disabled until a setting changes.
-- Reset discards unsaved form changes.
-- Input values are validated before the file is changed.
-- A safety copy named `ClippyServerManager.json.before-admin-settings.bak` is kept.
-- The page sends the fingerprint of the config it loaded. A save is rejected if another process changed the file in the meantime.
-- The replacement is written atomically.
-- The browser reloads after a successful save.
-
-Changes to the AdminHost port, database pools, timeouts, or stored-cargo editing mode take effect after the Admin Panel is reopened. DayZ-side telemetry and live-control changes take effect after the managed DayZ server is restarted.
-
-## Stored-cargo administration
-
-Stored-cargo writes use domain-specific endpoints, prepared PostgreSQL queries, a separate least-privilege edit role, short maintenance locks, revision checks, active-workflow checks, PostgreSQL transactions, recoverable before-state records, audit events, quarantine, snapshots, and revision-checked undo.
-
-Supported stored-cargo actions include:
-
-- Quantity and health edits
-- Item or subtree removal
-- Quarantine and restore
-- Move and copy
-- Nested detach-to-root
-- Root duplication
-- Snapshots and snapshot comparison
-- Change comparison and export
-- Selected-root export
-- Bounded bulk operations
-- Maintenance-lock management
-- Revision-checked undo
-
-Adapter-specific state JSON is not exposed as a generic editor because those fields need item-type validation.
-
-## Container telemetry
-
-The DayZ 1.0.0 mod reports container class, map, world position, first-seen state, and last-seen activity to the private storage service. The Admin Panel uses those fields for container details, filtering, and stale-container reports.
-
-Older database rows can show unknown class, map, or position until DayZ observes those containers again.
+The browser does not receive unrestricted SQL access, PostgreSQL credentials, Clippy service secrets, or DayZ signing material.
 
 ## Player telemetry
 
-Player telemetry is optional and disabled by default with `AdminPanel.EnablePlayerTelemetry`.
+Player telemetry is optional and disabled by default.
 
-When enabled, the DayZ server mod can report:
+When enabled, Clippy can record supported DayZ server data such as hashed player identity, names, online state, inventory snapshots, equipment, map position, ping estimates, bandwidth estimates, and recent Clippy activity.
 
-- Durable hashed DayZ player ID
-- Display and profile names
-- Alias history
-- Session player ID
-- Online activity
-- Inventory snapshots
-- Equipment summary
-- Map and world position
-- Ping estimates
-- Bandwidth estimates
-- Output-throttle measurements
-- Recent Clippy container activity
-- Player events
+The mod does not inspect player computers, hardware, files, or unrelated client data. The supported DayZ script interface does not expose a player IP-address getter, so Clippy does not collect player IP addresses through the mod.
 
-Historical snapshots are limited by `PlayerTelemetryRetentionDays` and `PlayerSnapshotHistoryLimit`. The searchable player-item index contains only each player's newest snapshot.
+## Live player controls
 
-`EnablePlayerNetworkTelemetry` and `EnablePlayerPositionTelemetry` can be controlled separately.
+Live player inventory controls are optional and require player telemetry.
 
-The supported DayZ script interface does not provide a player IP-address getter to the mod. Clippy does not scrape logs, inspect player machines, use the plaintext account ID, or invent an IP value.
+Commands execute against the live DayZ `PlayerBase` entity. Supported operations include requesting a fresh snapshot, giving an item, repairing an item, moving an item between online players, removing an item, and quarantine or restore operations.
 
-## Live player inventory control
+Commands use IDs, expiry, claim state, result reporting, validation, replay protection, and audit records.
 
-Live player control is optional and disabled by default with `AdminPanel.EnableLivePlayerControl`. It requires player telemetry.
+## Backups and recovery
 
-Commands are queued by AdminHost, claimed by the DayZ server-side Clippy script, executed against the live `PlayerBase` entity, and returned with success or failure. PostgreSQL is not used to fake a live DayZ inventory change.
+The server manager includes PostgreSQL backup, verification, restore, migration, and integrity checks.
 
-Supported live actions include:
+Database restore requires the DayZ server to be stopped. The restore workflow verifies the selected backup and creates a fresh safety backup before replacing the active database.
 
-- Request a fresh inventory snapshot
-- Give an item
-- Repair an item
-- Move an item between online players
-- Remove an item
-- Quarantine an item
-- Restore a quarantined item
+The Admin Panel also exposes session recovery, snapshots, quarantine, change history, and maintenance tools.
 
-Commands have unique IDs, short expiry, claim state, result state, auditing, validation, and replay protection. Live controls refuse items that belong to an active Clippy virtual-cargo materialization.
+## Compatibility
 
-## Reports
+Clippy does not require a framework.
 
-Reports are on-demand and bounded. The panel includes stored item-class totals, container-class counts, largest containers, stale-container counts, player-carried class totals when telemetry is enabled, and duplicate virtual item IDs.
+Mods that replace the same inventory actions, container classes, or mission hooks can conflict depending on load order. Custom locks, ownership systems, storage systems, vehicle inventory rules, and private item state may need an exclusion or adapter.
 
-The browser does not receive an unrestricted SQL endpoint.
+Test custom container and item mods before enabling them for virtual cargo.
 
-## PostgreSQL schema
+A container that already owns separate remote storage should not be treated as ordinary nested cargo inside another virtual-storage provider unless that integration has explicit identity handling.
 
-Schema version 8 added the derived `cargo_item_index`. `cargo_roots.tree_json` remains the source of truth.
+## Source layout
 
-Schema version 9 added Admin Panel maintenance locks, change history, quarantine, snapshots, and admin audit history.
+The GitHub Ready package contains the public source for the DayZ mod, native hosts, Admin Panel, and server manager.
 
-Schema version 10 added the player registry, aliases, inventory snapshots, derived player-item index, player events, live command queue, player quarantine, and richer container metadata.
+Important entry points include:
 
-Schema version 11 added network, profile, position, and telemetry-retention fields used by the 1.0.0 DayZ telemetry features.
+- `Source/Mod` for the DayZ mod source
+- `Source/Daemon` for ClippyStorageHost
+- `Source/AdminHost` for ClippyAdminHost
+- `Source/AdminWeb` for the Admin Panel frontend
+- `ClippyServerManager.ps1` for server setup and lifecycle management
 
-The manager backfills derived indexes in bounded work. A failed derived-index rebuild does not stop DayZ storage from starting.
-
-## Recovery, backups, and restore
-
-Recovery actions call ClippyStorageHost domain endpoints instead of rewriting operation or session status from the browser.
-
-The Backups page can create and verify backups. Database restore remains in `ClippyServerManager.ps1`. Restore refuses a running DayZ server, stops the private hosts, verifies the selected backup, creates and verifies a fresh safety backup, requires explicit confirmation, restores PostgreSQL, reapplies restricted roles, runs migrations and an integrity check, and leaves DayZ and StorageHost stopped.
+Release history belongs in `CHANGELOG.md`, Git commits, and GitHub release notes.
 
 ## Security
 
-The Admin Panel accepts loopback requests only. It uses a one-use bootstrap token, HttpOnly session cookie, CSRF token, Host and Origin checks, Fetch Metadata checks, security headers, request limits, and idle shutdown.
+The Admin Panel accepts loopback access only by default and uses session, CSRF, Host, Origin, request-size, and idle-shutdown controls.
 
-PostgreSQL is not exposed to players or the public network by Clippy. The browser does not receive PostgreSQL credentials, ClippyStorageHost service secrets, or DayZ signing material.
-
-The private `.biprivatekey` is never included in GitHub Ready, Workshop Upload, or Server Ready packages. The 1.0.3 Workshop payload is signed with the existing `ClippyVirtualCargo_0_1` identity.
-
-## Source and packages
-
-`START-CLIPPY-SERVER.bat` starts the server manager.
-
-`OPEN-CLIPPY-ADMIN.bat` opens the local authenticated Admin Panel.
-
-`ClippyVirtualCargoPayload` contains the signed Workshop payload, ClippyStorageHost, ClippyAdminHost, payload manifest, and default profile settings.
-
-`Source` in GitHub Ready contains the C++ hosts, AdminWeb source, DayZ mod source, and server-manager source. Source files are not included in Server Ready.
+The private DayZ signing key is not included in public GitHub, Workshop, or Server Ready packages.
 
 ## License
 

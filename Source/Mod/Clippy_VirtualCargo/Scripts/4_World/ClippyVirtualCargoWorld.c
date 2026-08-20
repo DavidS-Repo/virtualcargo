@@ -1368,7 +1368,28 @@ class CVCContainerService
 
     static bool ClientCanInteract(EntityAI container, PlayerBase player)
     {
-        return container && player && player.IsAlive() && vector.Distance(player.GetPosition(), container.GetPosition()) <= UAMaxDistances.DEFAULT;
+        // Clippy world actions must never remain available on an item after it moves
+        // into hands, cargo, or an attachment. The server clears the synced action
+        // state on that move, but this hierarchy check also closes the client-side
+        // replication window so vanilla held-item actions such as placement win.
+        return container && !container.GetHierarchyParent() && CVCContainerPolicy.HasCargo(container) && player && player.IsAlive() && vector.Distance(player.GetPosition(), container.GetPosition()) <= UAMaxDistances.DEFAULT;
+    }
+
+    static int PhysicalRootCount(EntityAI container)
+    {
+        if (!container || !container.GetInventory())
+            return 0;
+        CargoBase cargo = container.GetInventory().GetCargo();
+        if (!cargo)
+            return 0;
+        int count;
+        for (int index = 0; index < cargo.GetItemCount(); index++)
+        {
+            EntityAI cargoEntity = cargo.GetItem(index);
+            if (cargoEntity && cargoEntity.GetHierarchyParent() == container)
+                count++;
+        }
+        return count;
     }
 
     static void EnableEnforcement()
@@ -1415,7 +1436,6 @@ class CVCContainerService
             return;
         if (s_EnforcementReady)
             SetManagedLifecycle(container, true);
-        SetActionState(container, ACTION_NONE);
         s_Registered.Set(key, container);
         CVCContainerRuntime existing;
         if (s_States.Find(key, existing) && existing)
@@ -1424,12 +1444,27 @@ class CVCContainerService
             if (existing.phase == PHASE_ACTIVE && existing.session_id != "" && !existing.busy)
                 GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(CVCContainerService.Commit, 1000, false, existing);
         }
+        else if (PhysicalRootCount(container) == 0)
+        {
+            // An empty portable container does not need an existing-cargo migration
+            // before the player can open its virtual store. Prime its runtime now so
+            // dropping a barrel/crate never creates a locked-but-unusable window.
+            existing = State(container);
+        }
+
         CVCSessionData recovery;
         if (s_PendingRecovery.Find(key, recovery))
         {
+            SetActionState(container, ACTION_NONE);
             s_PendingRecovery.Remove(key);
             StartRecovery(container, recovery);
+            return;
         }
+
+        if (CVCMigrationService.IsStarted() && existing && !existing.busy && !existing.recovering && !existing.physical_fallback && existing.phase == PHASE_IDLE && PhysicalRootCount(container) == 0)
+            SetActionState(container, ACTION_OPEN);
+        else
+            SetActionState(container, ACTION_NONE);
     }
 
     static void Unregister(EntityAI container)
@@ -2719,6 +2754,11 @@ class CVCMigrationService
         }
     }
 
+    static bool IsStarted()
+    {
+        return s_Started;
+    }
+
     static void Start()
     {
         if (s_Started)
@@ -3363,6 +3403,23 @@ class ActionCVCRetrySave: ActionInteractBase
     }
 }
 
+// Keep the normal barrel Open action as the entry point. Once DayZ has opened the
+// lid, Clippy opens the virtual page for eligible world barrels. Nested barrels
+// such as one inside an M3S are not eligible and keep vanilla physical cargo.
+modded class ActionOpenBarrel
+{
+    override void OnExecuteServer(ActionData action_data)
+    {
+        super.OnExecuteServer(action_data);
+        if (!action_data || !action_data.m_Target || !action_data.m_Player)
+            return;
+        Barrel_ColorBase container = Barrel_ColorBase.Cast(action_data.m_Target.GetObject());
+        if (!container || !CVCContainerPolicy.IsEligible(container) || !CVCContainerPolicy.IsNativeInteractionReady(container))
+            return;
+        CVCContainerService.Open(container, action_data.m_Player, false);
+    }
+}
+
 modded class ItemBase
 {
     protected string m_CVCVirtualItemID;
@@ -3521,7 +3578,18 @@ modded class ItemBase
     {
         super.OnItemLocationChanged(old_owner, new_owner);
         if (!GetGame().IsServer())
+        {
+            // The hierarchy move is already known locally before the server's synced
+            // Clippy flags arrive. Clear stale world-provider UI state immediately so
+            // normal held-item placement and inventory actions are not hidden.
+            if (GetHierarchyParent())
+            {
+                m_CVCActionState = CVCContainerService.ACTION_NONE;
+                m_CVCManagedShell = false;
+                m_CVCMovementLocked = false;
+            }
             return;
+        }
         CVCSettings settings = CVCSettingsManager.Get();
         if (!CVCContainerPolicy.IsConfiguredContainerClass(this) && !settings.ReportUnlistedStorageCandidates)
             return;

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.4
+
+- Fixed portable storage pickup, placement & cargo access, plus medical actions on other players.
+
 ## 1.0.3
 
 - Fixed portable cargo containers losing their normal pickup-to-hands action while Clippy marked them as managed shells.
