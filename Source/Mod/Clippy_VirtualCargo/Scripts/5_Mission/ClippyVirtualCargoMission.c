@@ -685,16 +685,43 @@ modded class MissionServer
 
 modded class MissionGameplay
 {
+    protected bool m_CVCInventoryOpenApproved;
+    protected bool m_CVCInventoryOpenRequested;
+
+    void CVCCancelInventoryOpen()
+    {
+        m_CVCInventoryOpenRequested = false;
+    }
+
+    void CVCShowInventoryApproved()
+    {
+        m_CVCInventoryOpenRequested = false;
+        if (GetGame().GetUIManager().FindMenu(MENU_INVENTORY))
+            return;
+        m_CVCInventoryOpenApproved = true;
+        ShowInventory();
+        m_CVCInventoryOpenApproved = false;
+    }
+
     override void ShowInventory()
     {
-        super.ShowInventory();
+        if (m_CVCInventoryOpenApproved)
+        {
+            super.ShowInventory();
+            return;
+        }
+
         PlayerBase player = PlayerBase.Cast(GetGame().GetPlayer());
-        if (player && GetGame().GetUIManager().FindMenu(MENU_INVENTORY))
-            player.RPCSingleParam(CVCRPC.INVENTORY_OPEN, new Param1<int>(1), true, null);
+        if (!player || m_CVCInventoryOpenRequested)
+            return;
+
+        m_CVCInventoryOpenRequested = true;
+        player.RPCSingleParam(CVCRPC.INVENTORY_OPEN, new Param1<int>(1), true, null);
     }
 
     override void HideInventory()
     {
+        m_CVCInventoryOpenRequested = false;
         PlayerBase player = PlayerBase.Cast(GetGame().GetPlayer());
         if (player)
             player.RPCSingleParam(CVCRPC.CLOSE_INVENTORY, new Param1<int>(1), true, null);

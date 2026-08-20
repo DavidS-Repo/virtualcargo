@@ -21,6 +21,7 @@ class CVCGenericItemAdapter: CVCWorldItemAdapter
         node.state.temperature = item.GetTemperature();
         node.state.liquid_type = item.GetLiquidType();
         node.state.agents = item.GetAgents();
+        node.state.cvc_provider_key = CVCProviderIdentityRegistry.KnownProviderKey(item);
 
         TStringArray zones = new TStringArray;
         item.GetDamageZones(zones);
@@ -105,6 +106,8 @@ class CVCGenericItemAdapter: CVCWorldItemAdapter
             item.SetWet(node.state.wetness);
             item.SetTemperatureDirect(node.state.temperature);
             item.SetLiquidType(node.state.liquid_type);
+            if (node.state.cvc_provider_key != "")
+                CVCProviderIdentityRegistry.Bind(item, node.state.cvc_provider_key);
             foreach (CVCHealthZoneState zoneState : node.state.health_zones)
             {
                 if (zoneState)
@@ -210,10 +213,17 @@ class CVCItemAdapterRegistry
     }
 }
 
+class CVCProviderIdentityBinding
+{
+    string physical_key;
+    string provider_key;
+}
+
 class CVCProviderIdentityRegistryData
 {
-    int version = 1;
+    int version = 2;
     ref array<string> provider_keys = new array<string>;
+    ref array<ref CVCProviderIdentityBinding> bindings = new array<ref CVCProviderIdentityBinding>;
 }
 
 class CVCProviderIdentityRegistry
@@ -228,19 +238,23 @@ class CVCProviderIdentityRegistry
             return;
         s_Loaded = true;
         s_Data = new CVCProviderIdentityRegistryData;
-        if (!FileExist(PATH))
-            return;
-        CVCProviderIdentityRegistryData loaded;
-        string loadError;
-        if (JsonFileLoader<CVCProviderIdentityRegistryData>.LoadFile(PATH, loaded, loadError) && loaded)
-            s_Data = loaded;
-        else if (loadError != "")
-            ErrorEx("[Clippy Virtual Cargo] Provider identity registry could not be loaded: " + loadError);
+        if (FileExist(PATH))
+        {
+            CVCProviderIdentityRegistryData loaded;
+            string loadError;
+            if (JsonFileLoader<CVCProviderIdentityRegistryData>.LoadFile(PATH, loaded, loadError) && loaded)
+                s_Data = loaded;
+            else if (loadError != "")
+                ErrorEx("[Clippy Virtual Cargo] Provider identity registry could not be loaded: " + loadError);
+        }
         if (!s_Data.provider_keys)
             s_Data.provider_keys = new array<string>;
+        if (!s_Data.bindings)
+            s_Data.bindings = new array<ref CVCProviderIdentityBinding>;
+        s_Data.version = 2;
     }
 
-    protected static string Key(EntityAI entity)
+    static string PhysicalKey(EntityAI entity)
     {
         if (!entity)
             return "";
@@ -254,30 +268,78 @@ class CVCProviderIdentityRegistry
         return string.Format("%1:%2:%3:%4:%5", entity.GetType(), a, b, c, d);
     }
 
-    static void Remember(EntityAI entity)
+    static string KnownProviderKey(EntityAI entity)
     {
-        if (!GetGame().IsServer())
-            return;
-        string key = Key(entity);
-        if (key == "")
-            return;
+        string physicalKey = PhysicalKey(entity);
+        if (physicalKey == "")
+            return "";
         EnsureLoaded();
-        if (s_Data.provider_keys.Find(key) >= 0)
-            return;
-        s_Data.provider_keys.Insert(key);
+        foreach (CVCProviderIdentityBinding binding : s_Data.bindings)
+        {
+            if (binding && binding.physical_key == physicalKey && binding.provider_key != "")
+                return binding.provider_key;
+        }
+        if (s_Data.provider_keys.Find(physicalKey) >= 0)
+            return physicalKey;
+        return "";
+    }
+
+    static string ResolveProviderKey(EntityAI entity)
+    {
+        string known = KnownProviderKey(entity);
+        if (known != "")
+            return known;
+        return PhysicalKey(entity);
+    }
+
+    static void Save()
+    {
         MakeDirectory("$profile:ClippyVirtualCargo");
         string saveError;
         if (!JsonFileLoader<CVCProviderIdentityRegistryData>.SaveFile(PATH, s_Data, saveError))
             ErrorEx("[Clippy Virtual Cargo] Provider identity registry could not be saved: " + saveError);
     }
 
+    static void Bind(EntityAI entity, string providerKey)
+    {
+        if (!GetGame().IsServer() || !entity || providerKey == "")
+            return;
+        string physicalKey = PhysicalKey(entity);
+        if (physicalKey == "")
+            return;
+        EnsureLoaded();
+        foreach (CVCProviderIdentityBinding binding : s_Data.bindings)
+        {
+            if (binding && binding.physical_key == physicalKey)
+            {
+                if (binding.provider_key == providerKey)
+                    return;
+                binding.provider_key = providerKey;
+                Save();
+                return;
+            }
+        }
+        CVCProviderIdentityBinding created = new CVCProviderIdentityBinding;
+        created.physical_key = physicalKey;
+        created.provider_key = providerKey;
+        s_Data.bindings.Insert(created);
+        if (s_Data.provider_keys.Find(providerKey) < 0)
+            s_Data.provider_keys.Insert(providerKey);
+        Save();
+    }
+
+    static void Remember(EntityAI entity)
+    {
+        if (!GetGame().IsServer())
+            return;
+        string providerKey = ResolveProviderKey(entity);
+        if (providerKey != "")
+            Bind(entity, providerKey);
+    }
+
     static bool Contains(EntityAI entity)
     {
-        string key = Key(entity);
-        if (key == "")
-            return false;
-        EnsureLoaded();
-        return s_Data.provider_keys.Find(key) >= 0;
+        return KnownProviderKey(entity) != "";
     }
 }
 
@@ -288,11 +350,6 @@ class CVCItemTreeCodec
         if (!item)
         {
             reason = "item no longer exists";
-            return false;
-        }
-        if (item.GetInventory() && item.GetInventory().GetCargo() && CVCProviderIdentityRegistry.Contains(item))
-        {
-            reason = item.GetDisplayName() + " already owns a Clippy virtual-cargo identity and must remain physical while nested inside another storage provider";
             return false;
         }
         CVCSettings settings = CVCSettingsManager.Get();
@@ -661,16 +718,7 @@ class CVCContainerPolicy
 
     static string ProviderKey(EntityAI entity)
     {
-        if (!entity)
-            return "";
-        int a;
-        int b;
-        int c;
-        int d;
-        entity.GetPersistentID(a, b, c, d);
-        if (a == 0 && b == 0 && c == 0 && d == 0)
-            return "";
-        return string.Format("%1:%2:%3:%4:%5", entity.GetType(), a, b, c, d);
+        return CVCProviderIdentityRegistry.ResolveProviderKey(entity);
     }
 
     static bool CanAccess(EntityAI entity, PlayerBase player)
@@ -699,7 +747,7 @@ class CVCContainerPolicy
         reason = "";
         if (IsNativeInteractionReady(entity))
             return true;
-        reason = "open or unlock this container normally before opening virtual cargo";
+        reason = "open or unlock this container normally before accessing its cargo";
         return false;
     }
 }
@@ -724,6 +772,8 @@ class CVCContainerRuntime
     bool physical_interaction_pending;
     bool physical_interaction_tracking;
     string physical_interaction_baseline;
+    bool native_inventory_blocked;
+    string native_inventory_block_reason;
     bool migration_prepare_dispatched;
     int migration_retries;
     ref CVCSessionData recovery_session;
@@ -1183,6 +1233,13 @@ class CVCNativeOpenHandler: CVCResponseHandler
         }
 
         m_State.session_id = response.data.session_id;
+        if (response.data.next_cursor != "")
+        {
+            m_State.native_inventory_blocked = true;
+            m_State.native_inventory_block_reason = "stored cargo exceeds the transparent native-cargo materialization limit";
+            CVCContainerService.AbortOpening(m_State, m_State.native_inventory_block_reason + "; no partial cargo view was exposed");
+            return;
+        }
         response.data.provider_key = m_State.provider_key;
         CVCSessionJournalEntry journal = CVCSessionJournal.Begin(response.data);
         if (!journal)
@@ -1262,6 +1319,7 @@ class CVCContainerService
     protected static ref map<string, ref CVCSessionData> s_PendingRecovery = new map<string, ref CVCSessionData>;
     protected static ref array<ref CVCMaterializationJob> s_MaterializationQueue = new array<ref CVCMaterializationJob>;
     protected static ref array<PlayerBase> s_InventoryOpenPlayers = new array<PlayerBase>;
+    protected static ref array<PlayerBase> s_InventoryPreparingPlayers = new array<PlayerBase>;
     protected static bool s_MaterializationPumpScheduled;
     protected static bool s_EnforcementReady;
 
@@ -1292,15 +1350,10 @@ class CVCContainerService
 
     static bool ShouldLockMovement(EntityAI container)
     {
-        if (!container || !s_EnforcementReady || !CVCContainerPolicy.IsEligible(container))
-            return false;
-        string key = CVCContainerPolicy.ProviderKey(container);
-        if (key == "")
-            return false;
-        CVCContainerRuntime state;
-        if (!s_States.Find(key, state) || !state || state.physical_fallback)
-            return false;
-        return state.busy || state.phase != PHASE_IDLE || state.recovering || state.session_id != "" || state.active_migration != null || state.migration_prepare_dispatched || state.migration_retries > 0;
+        // Never override DayZ's native movement rules. Provider identity stays with the
+        // same physical entity while it moves, and nested-provider protection is handled
+        // separately. A stale workflow flag must never trap a container in a player's hands.
+        return false;
     }
 
     static void SyncMovementLock(EntityAI container)
@@ -1644,8 +1697,24 @@ class CVCContainerService
     {
         if (!GetGame().IsServer() || !player)
             return;
-        if (s_InventoryOpenPlayers.Find(player) == -1)
-            s_InventoryOpenPlayers.Insert(player);
+        if (s_InventoryOpenPlayers.Find(player) >= 0)
+        {
+            ApproveInventoryOpen(player);
+            return;
+        }
+        if (s_InventoryPreparingPlayers.Find(player) >= 0)
+            return;
+        s_InventoryPreparingPlayers.Insert(player);
+        PrepareInventoryOpen(player, GetGame().GetTime());
+    }
+
+    protected static void RemoveInventoryPreparingPlayer(PlayerBase player)
+    {
+        if (!player)
+            return;
+        int index = s_InventoryPreparingPlayers.Find(player);
+        if (index >= 0)
+            s_InventoryPreparingPlayers.RemoveOrdered(index);
     }
 
     protected static void RemoveInventoryOpenPlayer(PlayerBase player)
@@ -1665,35 +1734,152 @@ class CVCContainerService
             if (!player || !player.GetIdentity() || !player.IsAlive())
                 s_InventoryOpenPlayers.RemoveOrdered(index);
         }
+        for (int preparingIndex = s_InventoryPreparingPlayers.Count() - 1; preparingIndex >= 0; preparingIndex--)
+        {
+            PlayerBase preparingPlayer = s_InventoryPreparingPlayers[preparingIndex];
+            if (!preparingPlayer || !preparingPlayer.GetIdentity() || !preparingPlayer.IsAlive())
+                s_InventoryPreparingPlayers.RemoveOrdered(preparingIndex);
+        }
+    }
+
+    protected static bool PrepareContainerForNativeInventory(EntityAI container, PlayerBase player)
+    {
+        if (!container || !player || !CVCContainerPolicy.CanAccess(container, player) || !CVCContainerPolicy.IsNativeInteractionReady(container))
+            return false;
+        CVCContainerRuntime state = State(container);
+        if (!state || state.physical_fallback)
+            return false;
+        if (state.native_inventory_blocked)
+            return true;
+
+        if (state.phase == PHASE_RECOVERY)
+        {
+            if (!state.busy && ClientActionState(container) == ACTION_RETRY)
+                Retry(container, player);
+            return state.busy;
+        }
+
+        if (state.phase == PHASE_ACTIVE)
+            return false;
+
+        if (state.busy || state.recovering || state.phase != PHASE_IDLE || state.session_id != "" || state.active_migration != null || state.migration_prepare_dispatched)
+            return true;
+
+        if (PhysicalRootCount(container) > 0)
+        {
+            // Physical roots and SQL roots must never be exposed as two inventories.
+            // Import the physical roots first, then materialize the combined storage
+            // back into this same DayZ cargo grid before the inventory UI opens.
+            MarkPhysicalInteractionPending(state);
+            CVCMigrationService.Enqueue(container);
+            return true;
+        }
+
+        Open(container, player, false);
+        return state.busy || state.phase == PHASE_OPENING;
+    }
+
+    protected static void PrepareInventoryOpen(PlayerBase player, int startedMs)
+    {
+        if (!GetGame().IsServer() || !player || !player.GetIdentity() || !player.IsAlive())
+        {
+            RemoveInventoryPreparingPlayer(player);
+            return;
+        }
+
+        bool hasAccessibleProvider;
+        foreach (string probeKey, EntityAI probeContainer : s_Registered)
+        {
+            if (!probeContainer || probeContainer.GetHierarchyParent())
+                continue;
+            CVCContainerRuntime probeState;
+            if (s_States.Find(probeKey, probeState) && probeState && probeState.physical_fallback)
+                continue;
+            if (CVCContainerPolicy.CanAccess(probeContainer, player) && CVCContainerPolicy.IsNativeInteractionReady(probeContainer))
+            {
+                hasAccessibleProvider = true;
+                break;
+            }
+        }
+
+        // Do not block ordinary player inventory when no Clippy-managed cargo grid is
+        // actually visible. If a managed grid is visible, however, fail closed until
+        // recovery is ready so an empty physical grid can never masquerade as the store.
+        if (!hasAccessibleProvider)
+        {
+            ApproveInventoryOpen(player);
+            return;
+        }
+        if (!ClippyVirtualCargoAPI.IsReady() || !s_EnforcementReady || !CVCMigrationService.IsStarted())
+        {
+            RejectInventoryOpen(player, "Storage is still starting or unavailable; try inventory again.");
+            return;
+        }
+
+        bool waiting;
+        string blockedReason;
+        foreach (string providerKey, EntityAI container : s_Registered)
+        {
+            if (!container || container.GetHierarchyParent())
+                continue;
+            if (!CVCContainerPolicy.CanAccess(container, player) || !CVCContainerPolicy.IsNativeInteractionReady(container))
+                continue;
+            CVCContainerRuntime state = State(container);
+            if (state && state.native_inventory_blocked)
+            {
+                blockedReason = state.native_inventory_block_reason;
+                break;
+            }
+            if (PrepareContainerForNativeInventory(container, player))
+                waiting = true;
+        }
+
+        if (blockedReason != "")
+        {
+            RejectInventoryOpen(player, "Storage cannot be shown safely: " + blockedReason + ".");
+            return;
+        }
+
+        if (waiting && GetGame().GetTime() - startedMs < 12000)
+        {
+            GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(CVCContainerService.PrepareInventoryOpen, 100, false, player, startedMs);
+            return;
+        }
+
+        if (waiting)
+        {
+            RejectInventoryOpen(player, "Storage is still busy; inventory was not opened. Try again.");
+            return;
+        }
+        ApproveInventoryOpen(player);
+    }
+
+    protected static void RejectInventoryOpen(PlayerBase player, string reason)
+    {
+        if (!GetGame().IsServer() || !player || !player.GetIdentity())
+            return;
+        RemoveInventoryPreparingPlayer(player);
+        if (reason != "")
+            player.MessageStatus(reason);
+        player.RPCSingleParam(CVCRPC.OPEN_INVENTORY, new Param1<string>("cancel"), true, player.GetIdentity());
+    }
+
+    protected static void ApproveInventoryOpen(PlayerBase player)
+    {
+        if (!GetGame().IsServer() || !player || !player.GetIdentity())
+            return;
+        RemoveInventoryPreparingPlayer(player);
+        if (s_InventoryOpenPlayers.Find(player) < 0)
+            s_InventoryOpenPlayers.Insert(player);
+        player.RPCSingleParam(CVCRPC.OPEN_INVENTORY, new Param1<string>("native"), true, player.GetIdentity());
     }
 
     static bool HasPhysicalInteractionAccess(EntityAI container)
     {
-        if (!GetGame().IsServer() || !container || !s_EnforcementReady || !CVCMigrationService.IsStarted())
-            return false;
-        if (!CVCContainerPolicy.IsEligible(container) || !CVCContainerPolicy.IsNativeInteractionReady(container))
-            return false;
-
-        string key = CVCContainerPolicy.ProviderKey(container);
-        if (key == "")
-            return false;
-
-        CVCContainerRuntime state;
-        if (!s_States.Find(key, state) || !state || state.physical_fallback)
-            return false;
-        if (state.busy || state.recovering || state.phase != PHASE_IDLE || state.session_id != "" || state.active_migration != null || state.migration_prepare_dispatched)
-            return false;
-        if (PhysicalRootCount(container) > 0 && !CVCSettingsManager.Get().EnableExistingCargoMigration && !state.physical_interaction_pending && !state.physical_interaction_tracking && state.storage_id == "")
-            return false;
-
-        foreach (PlayerBase player : s_InventoryOpenPlayers)
-        {
-            if (player && player.GetIdentity() && player.IsAlive() && CVCContainerPolicy.CanAccess(container, player))
-            {
-                BeginPhysicalInteractionTracking(state, container);
-                return true;
-            }
-        }
+        // 1.0.6 no longer treats an open Tab menu as permission to write directly
+        // into an idle provider. Managed cargo is writable only while its SQL session
+        // is materialized into the native grid. This closes the old two-inventory path
+        // when a player walks into range with inventory already open.
         return false;
     }
 
@@ -1789,6 +1975,8 @@ class CVCContainerService
         CVCContainerRuntime state;
         if (!s_States.Find(key, state) || !state)
             return false;
+        if (state.native_inventory_blocked)
+            return false;
         if (state.physical_fallback || state.internal_mutation)
             return true;
         if (state.phase == PHASE_ACTIVE && state.session_id != "" && state.player && CVCContainerPolicy.CanAccess(container, state.player))
@@ -1824,15 +2012,12 @@ class CVCContainerService
     static bool CanOpen(EntityAI container)
     {
         CVCContainerRuntime state;
-        if (!container)
+        if (!container || !GetGame().IsServer())
             return false;
-        if (!GetGame().IsServer())
-            return ClientActionState(container) == ACTION_OPEN;
-        if (CVCContainerPolicy.ProviderKey(container) == "")
+        string key = CVCContainerPolicy.ProviderKey(container);
+        if (key == "" || !s_States.Find(key, state))
             return false;
-        if (!s_States.Find(CVCContainerPolicy.ProviderKey(container), state))
-            return false;
-        return state && ClientActionState(container) == ACTION_OPEN && !state.physical_fallback && !state.busy && state.phase == PHASE_IDLE;
+        return state && !state.physical_fallback && !state.busy && !state.recovering && state.phase == PHASE_IDLE && state.session_id == "" && state.active_migration == null && !state.migration_prepare_dispatched;
     }
 
     static bool IsPhysicalFallback(EntityAI container)
@@ -1942,7 +2127,7 @@ class CVCContainerService
         request.cursor = "";
         if (nextPage)
             request.cursor = state.next_cursor;
-        request.limit = Math.Clamp(CVCSettingsManager.Get().NativePageSize, 1, 200);
+        request.limit = Math.Clamp(CVCSettingsManager.Get().VirtualRootCapacity, 1, 200);
         state.cursor = request.cursor;
         if (!ClippyVirtualCargoAPI.Post("/v1/session/open", request, new CVCNativeOpenHandler(state)))
             OpenUncertain(state, "could not dispatch the cargo open request; restart recovery is required");
@@ -2018,6 +2203,7 @@ class CVCContainerService
     {
         if (!GetGame().IsServer() || !player)
             return;
+        RemoveInventoryPreparingPlayer(player);
         RemoveInventoryOpenPlayer(player);
         foreach (string key, CVCContainerRuntime state : s_States)
         {
@@ -2401,8 +2587,6 @@ class CVCContainerService
             GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(CVCContainerService.Commit, 250, false, state);
             return;
         }
-        if (CVCSettingsManager.Get().AutoOpenInventory)
-            state.player.RPCSingleParam(CVCRPC.OPEN_INVENTORY, new Param1<string>(state.provider_key), true, state.player.GetIdentity());
     }
 
     static string NewVirtualRootID(CVCContainerRuntime state)
@@ -2832,6 +3016,24 @@ class CVCContainerService
         if (!GetGame().IsServer())
             return;
         PruneInventoryOpenPlayers();
+
+        // A container can enter vicinity while Tab is already open. Prepare newly
+        // visible providers here too; until they reach PHASE_ACTIVE their native cargo
+        // hooks remain locked, so SQL contents can never coexist with a writable empty grid.
+        foreach (PlayerBase inventoryPlayer : s_InventoryOpenPlayers)
+        {
+            if (!inventoryPlayer || !inventoryPlayer.GetIdentity() || !inventoryPlayer.IsAlive())
+                continue;
+            foreach (string openProviderKey, EntityAI openContainer : s_Registered)
+            {
+                if (!openContainer || openContainer.GetHierarchyParent())
+                    continue;
+                if (!CVCContainerPolicy.CanAccess(openContainer, inventoryPlayer) || !CVCContainerPolicy.IsNativeInteractionReady(openContainer))
+                    continue;
+                PrepareContainerForNativeInventory(openContainer, inventoryPlayer);
+            }
+        }
+
         FlushPendingPhysicalInteractions();
         int nowMs = GetGame().GetTime();
         array<EntityAI> settledNested = new array<EntityAI>;
@@ -3673,73 +3875,6 @@ class CVCMigrationService
     }
 }
 
-// Clippy container actions are world-object interactions, not held-item single-use actions.
-// Keeping them on InteractActionInput prevents them from competing with vanilla
-// target-player actions such as feeding medicine to another survivor. ActionInteractBase
-// does not use the held item, so these actions must not require empty hands.
-class ActionCVCOpenNativeCargo: ActionInteractBase
-{
-    void ActionCVCOpenNativeCargo() { m_Text = "Open virtual cargo"; }
-    override void CreateConditionComponents()
-    {
-        m_ConditionItem = new CCINone;
-        m_ConditionTarget = new CCTObject(UAMaxDistances.DEFAULT);
-    }
-    override bool ActionCondition(PlayerBase player, ActionTarget target, ItemBase item)
-    {
-        EntityAI container = EntityAI.Cast(target.GetObject());
-        if (!GetGame().IsServer())
-            return CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.CanOpen(container);
-        return CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.CanOpen(container);
-    }
-    override void OnExecuteServer(ActionData action_data)
-    {
-        CVCContainerService.Open(EntityAI.Cast(action_data.m_Target.GetObject()), action_data.m_Player, false);
-    }
-}
-
-class ActionCVCOpenNextPage: ActionInteractBase
-{
-    void ActionCVCOpenNextPage() { m_Text = "Open next virtual cargo page"; }
-    override void CreateConditionComponents()
-    {
-        m_ConditionItem = new CCINone;
-        m_ConditionTarget = new CCTObject(UAMaxDistances.DEFAULT);
-    }
-    override bool ActionCondition(PlayerBase player, ActionTarget target, ItemBase item)
-    {
-        EntityAI container = EntityAI.Cast(target.GetObject());
-        if (!GetGame().IsServer())
-            return CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.HasNextPage(container);
-        return CVCContainerPolicy.IsNativeInteractionReady(container) && CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.HasNextPage(container);
-    }
-    override void OnExecuteServer(ActionData action_data)
-    {
-        CVCContainerService.Open(EntityAI.Cast(action_data.m_Target.GetObject()), action_data.m_Player, true);
-    }
-}
-
-class ActionCVCRetrySave: ActionInteractBase
-{
-    void ActionCVCRetrySave() { m_Text = "Retry virtual cargo save"; }
-    override void CreateConditionComponents()
-    {
-        m_ConditionItem = new CCINone;
-        m_ConditionTarget = new CCTObject(UAMaxDistances.DEFAULT);
-    }
-    override bool ActionCondition(PlayerBase player, ActionTarget target, ItemBase item)
-    {
-        EntityAI container = EntityAI.Cast(target.GetObject());
-        if (!GetGame().IsServer())
-            return CVCContainerService.ClientCanInteract(container, player) && CVCContainerService.NeedsRetry(container);
-        return CVCContainerPolicy.CanAccess(container, player) && CVCContainerService.NeedsRetry(container);
-    }
-    override void OnExecuteServer(ActionData action_data)
-    {
-        CVCContainerService.Retry(EntityAI.Cast(action_data.m_Target.GetObject()), action_data.m_Player);
-    }
-}
-
 modded class ItemBase
 {
     protected string m_CVCVirtualItemID;
@@ -3834,53 +3969,17 @@ modded class ItemBase
         }
     }
 
-    override void SetActions()
-    {
-        super.SetActions();
-
-        // Only cargo-capable ItemBase objects can ever be managed by Clippy.
-        // Do not add Clippy actions to medicine, food, tools, or other ordinary
-        // held items because that can interfere with their vanilla target actions.
-        if (!CVCContainerPolicy.HasCargo(this))
-            return;
-
-        AddAction(ActionCVCOpenNativeCargo);
-        AddAction(ActionCVCOpenNextPage);
-        AddAction(ActionCVCRetrySave);
-    }
 
     override bool CanReceiveItemIntoCargo(EntityAI item)
     {
         if (GetGame().IsServer())
         {
-            if (CVCContainerService.HasActivePage(this) && CVCProviderIdentityRegistry.Contains(item))
-                return false;
             if (!CVCContainerService.AllowsPhysicalCargo(this))
                 return false;
         }
         return super.CanReceiveItemIntoCargo(item);
     }
 
-    override bool CanPutInCargo(EntityAI parent)
-    {
-        if (m_CVCMovementLocked)
-            return false;
-        return super.CanPutInCargo(parent);
-    }
-
-    override bool CanPutIntoHands(EntityAI parent)
-    {
-        if (m_CVCMovementLocked)
-            return false;
-        return super.CanPutIntoHands(parent);
-    }
-
-    override bool CanPutAsAttachment(EntityAI parent)
-    {
-        if (m_CVCMovementLocked)
-            return false;
-        return super.CanPutAsAttachment(parent);
-    }
 
     override bool CanReleaseCargo(EntityAI cargo)
     {
@@ -3989,20 +4088,11 @@ modded class CarScript
         }
     }
 
-    override void SetActions()
-    {
-        super.SetActions();
-        AddAction(ActionCVCOpenNativeCargo);
-        AddAction(ActionCVCOpenNextPage);
-        AddAction(ActionCVCRetrySave);
-    }
 
     override bool CanReceiveItemIntoCargo(EntityAI item)
     {
         if (GetGame().IsServer())
         {
-            if (CVCContainerService.HasActivePage(this) && CVCProviderIdentityRegistry.Contains(item))
-                return false;
             if (!CVCContainerService.AllowsPhysicalCargo(this))
                 return false;
         }
@@ -4049,8 +4139,14 @@ modded class PlayerBase
         if (rpc_type == CVCRPC.OPEN_INVENTORY && GetGame().IsClient())
         {
             Param1<string> openData;
-            if (ctx.Read(openData) && GetGame().GetMission())
-                GetGame().GetMission().ShowInventory();
+            MissionGameplay mission = MissionGameplay.Cast(GetGame().GetMission());
+            if (ctx.Read(openData) && mission)
+            {
+                if (openData.param1 == "native")
+                    mission.CVCShowInventoryApproved();
+                else
+                    mission.CVCCancelInventoryOpen();
+            }
         }
         else if (rpc_type == CVCRPC.INVENTORY_OPEN && GetGame().IsServer())
         {
@@ -4063,13 +4159,3 @@ modded class PlayerBase
     }
 }
 
-modded class ActionConstructor
-{
-    override void RegisterActions(TTypenameArray actions)
-    {
-        super.RegisterActions(actions);
-        actions.Insert(ActionCVCOpenNativeCargo);
-        actions.Insert(ActionCVCOpenNextPage);
-        actions.Insert(ActionCVCRetrySave);
-    }
-}

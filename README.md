@@ -8,11 +8,11 @@ This is container storage, not a player bank or shared account system.
 
 ## How it works
 
-When an eligible container is closed, Clippy captures its cargo tree and stores it in PostgreSQL. Item roots include attachments and nested cargo.
+Clippy uses the container's normal DayZ cargo grid as the only player-facing inventory. There is no separate virtual-cargo inventory or alternate storage prompt.
 
-When a player opens virtual cargo, Clippy rebuilds a bounded page of those items inside the real DayZ container. The player uses normal DayZ inventory controls while that page is open. Closing inventory, leaving range, disconnecting, or ending the session commits the page back to storage.
+When nobody is using an eligible container, Clippy stores its cargo tree in PostgreSQL and removes those item entities from the live world. When a player opens DayZ inventory near an accessible container, Clippy restores the stored cargo into that same native cargo grid before the inventory opens. Closing inventory, leaving range, disconnecting, or moving the container out of its world position saves the live cargo back to storage.
 
-Only one active virtual-cargo session can control the same container at a time.
+Native DayZ access rules still apply. Lids, doors, locks, ownership systems, and other container rules are not bypassed.
 
 ## Container scope
 
@@ -46,11 +46,9 @@ Unsafe item trees fail closed instead of being partly removed from DayZ. Default
 
 ## Player use
 
-Aim at an enabled container and use the Clippy virtual-cargo action when it is available.
+Use containers normally. Open or unlock them with their normal DayZ or mod-provided action, then open inventory with the standard DayZ controls.
 
-Large inventories are loaded in pages. Clippy provides actions for opening the next page and retrying a failed save.
-
-Native DayZ container rules still apply. Lockable or openable containers must satisfy their normal access rules before Clippy exposes stored cargo.
+Clippy does not add an `Open virtual cargo` prompt. Items are shown in the container's normal cargo grid and use normal dragging, attachments, nested cargo, placement, pickup, and vehicle inventory rules.
 
 ## Server companion
 

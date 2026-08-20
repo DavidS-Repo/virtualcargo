@@ -247,6 +247,7 @@ class CVCItemState
     ref array<ref CVCCartridgeState> magazine_cartridges = new array<ref CVCCartridgeState>;
     int current_muzzle = -1;
     ref array<ref CVCWeaponMuzzleState> weapon_muzzles = new array<ref CVCWeaponMuzzleState>;
+    string cvc_provider_key;
     string custom_json;
 }
 

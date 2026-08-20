@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.6
+
+- Removed the separate virtual-cargo inventory actions.
+- Virtualized contents now use the container's normal DayZ cargo grid.
+- Fixed portable containers becoming stuck in hands or blocked from normal placement/movement.
+- Physical and stored cargo are reconciled before inventory opens.
+
 ## 1.0.5
 
 - Fixed cargo access & movement for storage containers.
