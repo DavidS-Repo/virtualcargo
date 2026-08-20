@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.5
+
+- Fixed cargo access & movement for storage containers.
+
 ## 1.0.4
 
 - Fixed portable storage pickup, placement & cargo access, plus medical actions on other players.

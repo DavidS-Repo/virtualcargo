@@ -685,6 +685,14 @@ modded class MissionServer
 
 modded class MissionGameplay
 {
+    override void ShowInventory()
+    {
+        super.ShowInventory();
+        PlayerBase player = PlayerBase.Cast(GetGame().GetPlayer());
+        if (player && GetGame().GetUIManager().FindMenu(MENU_INVENTORY))
+            player.RPCSingleParam(CVCRPC.INVENTORY_OPEN, new Param1<int>(1), true, null);
+    }
+
     override void HideInventory()
     {
         PlayerBase player = PlayerBase.Cast(GetGame().GetPlayer());

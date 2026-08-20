@@ -48,6 +48,7 @@ class CVCRPC
 {
     static const int OPEN_INVENTORY = 834061;
     static const int CLOSE_INVENTORY = 834062;
+    static const int INVENTORY_OPEN = 834063;
 }
 
 class CVCSettingsManager

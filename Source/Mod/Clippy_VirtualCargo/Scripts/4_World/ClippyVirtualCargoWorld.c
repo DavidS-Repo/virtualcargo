@@ -210,6 +210,77 @@ class CVCItemAdapterRegistry
     }
 }
 
+class CVCProviderIdentityRegistryData
+{
+    int version = 1;
+    ref array<string> provider_keys = new array<string>;
+}
+
+class CVCProviderIdentityRegistry
+{
+    static const string PATH = "$profile:ClippyVirtualCargo/ProviderIdentityRegistry.json";
+    protected static ref CVCProviderIdentityRegistryData s_Data;
+    protected static bool s_Loaded;
+
+    protected static void EnsureLoaded()
+    {
+        if (s_Loaded)
+            return;
+        s_Loaded = true;
+        s_Data = new CVCProviderIdentityRegistryData;
+        if (!FileExist(PATH))
+            return;
+        CVCProviderIdentityRegistryData loaded;
+        string loadError;
+        if (JsonFileLoader<CVCProviderIdentityRegistryData>.LoadFile(PATH, loaded, loadError) && loaded)
+            s_Data = loaded;
+        else if (loadError != "")
+            ErrorEx("[Clippy Virtual Cargo] Provider identity registry could not be loaded: " + loadError);
+        if (!s_Data.provider_keys)
+            s_Data.provider_keys = new array<string>;
+    }
+
+    protected static string Key(EntityAI entity)
+    {
+        if (!entity)
+            return "";
+        int a;
+        int b;
+        int c;
+        int d;
+        entity.GetPersistentID(a, b, c, d);
+        if (a == 0 && b == 0 && c == 0 && d == 0)
+            return "";
+        return string.Format("%1:%2:%3:%4:%5", entity.GetType(), a, b, c, d);
+    }
+
+    static void Remember(EntityAI entity)
+    {
+        if (!GetGame().IsServer())
+            return;
+        string key = Key(entity);
+        if (key == "")
+            return;
+        EnsureLoaded();
+        if (s_Data.provider_keys.Find(key) >= 0)
+            return;
+        s_Data.provider_keys.Insert(key);
+        MakeDirectory("$profile:ClippyVirtualCargo");
+        string saveError;
+        if (!JsonFileLoader<CVCProviderIdentityRegistryData>.SaveFile(PATH, s_Data, saveError))
+            ErrorEx("[Clippy Virtual Cargo] Provider identity registry could not be saved: " + saveError);
+    }
+
+    static bool Contains(EntityAI entity)
+    {
+        string key = Key(entity);
+        if (key == "")
+            return false;
+        EnsureLoaded();
+        return s_Data.provider_keys.Find(key) >= 0;
+    }
+}
+
 class CVCItemTreeCodec
 {
     static bool CanCaptureTree(ItemBase item, out string reason)
@@ -217,6 +288,11 @@ class CVCItemTreeCodec
         if (!item)
         {
             reason = "item no longer exists";
+            return false;
+        }
+        if (item.GetInventory() && item.GetInventory().GetCargo() && CVCProviderIdentityRegistry.Contains(item))
+        {
+            reason = item.GetDisplayName() + " already owns a Clippy virtual-cargo identity and must remain physical while nested inside another storage provider";
             return false;
         }
         CVCSettings settings = CVCSettingsManager.Get();
@@ -645,6 +721,9 @@ class CVCContainerRuntime
     bool internal_mutation;
     bool recovering;
     bool physical_fallback;
+    bool physical_interaction_pending;
+    bool physical_interaction_tracking;
+    string physical_interaction_baseline;
     bool migration_prepare_dispatched;
     int migration_retries;
     ref CVCSessionData recovery_session;
@@ -990,6 +1069,8 @@ class CVCNativeResolveHandler: CVCResponseHandler
         }
         m_State.storage_id = response.data.storage_id;
         m_State.revision = response.data.revision;
+        if (m_State.storage_id != "")
+            CVCProviderIdentityRegistry.Remember(m_State.container);
         CVCContainerService.OpenResolved(m_State, m_NextPage);
     }
 
@@ -1180,6 +1261,7 @@ class CVCContainerService
     protected static ref map<string, EntityAI> s_Registered = new map<string, EntityAI>;
     protected static ref map<string, ref CVCSessionData> s_PendingRecovery = new map<string, ref CVCSessionData>;
     protected static ref array<ref CVCMaterializationJob> s_MaterializationQueue = new array<ref CVCMaterializationJob>;
+    protected static ref array<PlayerBase> s_InventoryOpenPlayers = new array<PlayerBase>;
     protected static bool s_MaterializationPumpScheduled;
     protected static bool s_EnforcementReady;
 
@@ -1479,9 +1561,11 @@ class CVCContainerService
         if (!s_States.Find(key, state) || !state)
             return;
         state.container = null;
+        state.physical_interaction_tracking = false;
+        state.physical_interaction_baseline = "";
         if (state.recovering && state.recovery_session)
             s_PendingRecovery.Set(key, state.recovery_session);
-        if (state.phase == PHASE_IDLE && !state.busy && !state.recovering && !state.physical_fallback)
+        if (state.phase == PHASE_IDLE && !state.busy && !state.recovering && !state.physical_fallback && !state.physical_interaction_pending)
             s_States.Remove(key);
     }
 
@@ -1522,10 +1606,181 @@ class CVCContainerService
         return !state.internal_mutation && state.phase != PHASE_ACTIVE;
     }
 
+    protected static string PhysicalRootFingerprint(EntityAI container)
+    {
+        if (!container || !container.GetInventory() || !container.GetInventory().GetCargo())
+            return "";
+        array<string> keys = new array<string>;
+        CargoBase cargo = container.GetInventory().GetCargo();
+        for (int index = 0; index < cargo.GetItemCount(); index++)
+        {
+            EntityAI cargoEntity = cargo.GetItem(index);
+            if (!cargoEntity || cargoEntity.GetHierarchyParent() != container)
+                continue;
+            ItemBase item = ItemBase.Cast(cargoEntity);
+            string rootKey;
+            if (item)
+                rootKey = CVCPhysicalRootIdentity.Key(item);
+            if (rootKey == "")
+                rootKey = string.Format("%1:%2", cargoEntity.GetType(), index);
+            keys.Insert(rootKey);
+        }
+        keys.Sort();
+        string fingerprint = keys.Count().ToString();
+        foreach (string key : keys)
+            fingerprint += "|" + key;
+        return fingerprint;
+    }
+
+    protected static void BeginPhysicalInteractionTracking(CVCContainerRuntime state, EntityAI container)
+    {
+        if (!state || !container || state.physical_interaction_tracking)
+            return;
+        state.physical_interaction_tracking = true;
+        state.physical_interaction_baseline = PhysicalRootFingerprint(container);
+    }
+
+    static void InventoryOpened(PlayerBase player)
+    {
+        if (!GetGame().IsServer() || !player)
+            return;
+        if (s_InventoryOpenPlayers.Find(player) == -1)
+            s_InventoryOpenPlayers.Insert(player);
+    }
+
+    protected static void RemoveInventoryOpenPlayer(PlayerBase player)
+    {
+        if (!player)
+            return;
+        int index = s_InventoryOpenPlayers.Find(player);
+        if (index >= 0)
+            s_InventoryOpenPlayers.RemoveOrdered(index);
+    }
+
+    protected static void PruneInventoryOpenPlayers()
+    {
+        for (int index = s_InventoryOpenPlayers.Count() - 1; index >= 0; index--)
+        {
+            PlayerBase player = s_InventoryOpenPlayers[index];
+            if (!player || !player.GetIdentity() || !player.IsAlive())
+                s_InventoryOpenPlayers.RemoveOrdered(index);
+        }
+    }
+
+    static bool HasPhysicalInteractionAccess(EntityAI container)
+    {
+        if (!GetGame().IsServer() || !container || !s_EnforcementReady || !CVCMigrationService.IsStarted())
+            return false;
+        if (!CVCContainerPolicy.IsEligible(container) || !CVCContainerPolicy.IsNativeInteractionReady(container))
+            return false;
+
+        string key = CVCContainerPolicy.ProviderKey(container);
+        if (key == "")
+            return false;
+
+        CVCContainerRuntime state;
+        if (!s_States.Find(key, state) || !state || state.physical_fallback)
+            return false;
+        if (state.busy || state.recovering || state.phase != PHASE_IDLE || state.session_id != "" || state.active_migration != null || state.migration_prepare_dispatched)
+            return false;
+        if (PhysicalRootCount(container) > 0 && !CVCSettingsManager.Get().EnableExistingCargoMigration && !state.physical_interaction_pending && !state.physical_interaction_tracking && state.storage_id == "")
+            return false;
+
+        foreach (PlayerBase player : s_InventoryOpenPlayers)
+        {
+            if (player && player.GetIdentity() && player.IsAlive() && CVCContainerPolicy.CanAccess(container, player))
+            {
+                BeginPhysicalInteractionTracking(state, container);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool HasPendingPhysicalInteraction(EntityAI container)
+    {
+        if (!container)
+            return false;
+        string key = CVCContainerPolicy.ProviderKey(container);
+        CVCContainerRuntime state;
+        return key != "" && s_States.Find(key, state) && state && state.physical_interaction_pending;
+    }
+
+    static void ClearPhysicalInteractionPending(EntityAI container)
+    {
+        if (!container)
+            return;
+        string key = CVCContainerPolicy.ProviderKey(container);
+        CVCContainerRuntime state;
+        if (key == "" || !s_States.Find(key, state) || !state)
+            return;
+        state.physical_interaction_pending = false;
+        if (!state.physical_fallback && !state.busy && !state.recovering && state.phase == PHASE_IDLE)
+            SetActionState(container, ACTION_OPEN);
+    }
+
+    protected static void MarkPhysicalInteractionPending(CVCContainerRuntime state)
+    {
+        if (!state || state.physical_fallback || state.internal_mutation || state.busy || state.recovering || state.phase != PHASE_IDLE)
+            return;
+        state.physical_interaction_pending = true;
+        if (state.container)
+            SetActionState(state.container, ACTION_NONE);
+    }
+
+    static void NotePhysicalCargoChange(EntityAI container)
+    {
+        if (!GetGame().IsServer() || !container || !CVCContainerPolicy.IsEligible(container))
+            return;
+        CVCContainerRuntime state = State(container);
+        MarkPhysicalInteractionPending(state);
+    }
+
+    protected static void FlushPendingPhysicalInteractions()
+    {
+        foreach (string key, CVCContainerRuntime state : s_States)
+        {
+            if (!state || !state.container || state.physical_fallback)
+                continue;
+            bool interactionOpen = HasPhysicalInteractionAccess(state.container);
+            if (state.physical_interaction_tracking && !interactionOpen)
+            {
+                string currentFingerprint = PhysicalRootFingerprint(state.container);
+                if (currentFingerprint != state.physical_interaction_baseline)
+                    MarkPhysicalInteractionPending(state);
+                state.physical_interaction_tracking = false;
+                state.physical_interaction_baseline = "";
+            }
+            if (!state.physical_interaction_pending || interactionOpen)
+                continue;
+            if (PhysicalRootCount(state.container) == 0)
+            {
+                state.physical_interaction_pending = false;
+                if (!state.busy && !state.recovering && state.phase == PHASE_IDLE)
+                    SetActionState(state.container, ACTION_OPEN);
+                continue;
+            }
+            CVCMigrationService.Enqueue(state.container);
+        }
+    }
+
     static bool AllowsPhysicalCargo(EntityAI container)
     {
-        if (!container || !CVCContainerPolicy.IsEligible(container))
+        if (!container)
             return true;
+        if (!CVCContainerPolicy.IsEligible(container))
+        {
+            string nestedKey = CVCContainerPolicy.ProviderKey(container);
+            CVCContainerRuntime nestedState;
+            if (nestedKey != "" && s_States.Find(nestedKey, nestedState) && nestedState && !nestedState.physical_fallback)
+            {
+                if (nestedState.internal_mutation)
+                    return true;
+                if (nestedState.busy || nestedState.recovering || nestedState.phase != PHASE_IDLE || nestedState.session_id != "" || nestedState.active_migration != null || nestedState.migration_prepare_dispatched)
+                    return false;
+            }
+            return true;
+        }
         if (!s_EnforcementReady)
             return true;
         string key = CVCContainerPolicy.ProviderKey(container);
@@ -1534,11 +1789,36 @@ class CVCContainerService
         CVCContainerRuntime state;
         if (!s_States.Find(key, state) || !state)
             return false;
-        if (state.physical_fallback)
+        if (state.physical_fallback || state.internal_mutation)
             return true;
-        if (state.internal_mutation)
+        if (state.phase == PHASE_ACTIVE && state.session_id != "" && state.player && CVCContainerPolicy.CanAccess(container, state.player))
             return true;
-        return state.phase == PHASE_ACTIVE && state.session_id != "" && state.player && CVCContainerPolicy.CanAccess(container, state.player);
+        if (HasPhysicalInteractionAccess(container))
+            return true;
+        return false;
+    }
+
+    static bool HasUnsettledWorkflow(EntityAI container)
+    {
+        if (!GetGame().IsServer() || !container)
+            return false;
+        string key = CVCContainerPolicy.ProviderKey(container);
+        CVCContainerRuntime state;
+        if (key == "" || !s_States.Find(key, state) || !state)
+            return false;
+        return state.busy || state.recovering || state.phase != PHASE_IDLE || state.session_id != "" || state.active_migration != null || state.migration_prepare_dispatched;
+    }
+
+    static void SettleAfterHierarchyMove(EntityAI container)
+    {
+        if (!GetGame().IsServer() || !container)
+            return;
+        string key = CVCContainerPolicy.ProviderKey(container);
+        CVCContainerRuntime state;
+        if (key == "" || !s_States.Find(key, state) || !state)
+            return;
+        if (state.phase == PHASE_ACTIVE && state.session_id != "" && !state.busy)
+            Commit(state);
     }
 
     static bool CanOpen(EntityAI container)
@@ -1572,6 +1852,9 @@ class CVCContainerService
         state.phase = PHASE_IDLE;
         state.player = null;
         state.migration_retries = 0;
+        state.physical_interaction_pending = false;
+        state.physical_interaction_tracking = false;
+        state.physical_interaction_baseline = "";
         SetManagedLifecycle(container, false);
         SyncMovementLock(container);
         SetActionState(container, ACTION_NONE);
@@ -1641,9 +1924,14 @@ class CVCContainerService
 
     static void OpenResolved(CVCContainerRuntime state, bool nextPage)
     {
-        if (!state || !state.player || !state.player.GetIdentity())
+        if (!state || !state.container || !state.player || !state.player.GetIdentity())
         {
-            Fail(state, "player identity is unavailable");
+            Fail(state, "player or container identity is unavailable");
+            return;
+        }
+        if (!CVCContainerPolicy.CanAccess(state.container, state.player) || !CVCContainerPolicy.IsNativeInteractionReady(state.container))
+        {
+            Fail(state, "container is no longer available for virtual cargo");
             return;
         }
         CVCSessionOpenRequest request = new CVCSessionOpenRequest;
@@ -1730,11 +2018,13 @@ class CVCContainerService
     {
         if (!GetGame().IsServer() || !player)
             return;
+        RemoveInventoryOpenPlayer(player);
         foreach (string key, CVCContainerRuntime state : s_States)
         {
             if (state && state.player == player && state.phase == PHASE_ACTIVE)
                 Commit(state);
         }
+        FlushPendingPhysicalInteractions();
     }
 
     static void QueueRecovery(CVCSessionData recovery)
@@ -1761,6 +2051,8 @@ class CVCContainerService
         }
         state.storage_id = recovery.storage_id;
         state.revision = recovery.expected_revision;
+        if (state.storage_id != "")
+            CVCProviderIdentityRegistry.Remember(container);
         state.session_id = recovery.session_id;
         state.player = null;
         state.busy = false;
@@ -2539,11 +2831,22 @@ class CVCContainerService
     {
         if (!GetGame().IsServer())
             return;
+        PruneInventoryOpenPlayers();
+        FlushPendingPhysicalInteractions();
         int nowMs = GetGame().GetTime();
+        array<EntityAI> settledNested = new array<EntityAI>;
         foreach (string key, CVCContainerRuntime state : s_States)
         {
             if (!state || !state.container)
                 continue;
+            if (state.container.GetHierarchyParent())
+            {
+                if (state.phase == PHASE_ACTIVE && state.session_id != "" && !state.busy)
+                    Commit(state);
+                if (!state.busy && !state.recovering && state.phase == PHASE_IDLE && state.session_id == "" && state.active_migration == null && !state.migration_prepare_dispatched)
+                    settledNested.Insert(state.container);
+                continue;
+            }
             if (state.phase == PHASE_ACTIVE && (!state.player || !CVCContainerPolicy.CanAccess(state.container, state.player)))
             {
                 Commit(state);
@@ -2556,6 +2859,18 @@ class CVCContainerService
             }
             if (state.storage_id != "" && (state.last_metadata_report_ms == 0 || nowMs - state.last_metadata_report_ms >= 60000))
                 CVCContainerMetadata.Observe(state);
+        }
+        foreach (EntityAI nestedContainer : settledNested)
+        {
+            Unregister(nestedContainer);
+            CVCMigrationService.UnregisterCandidate(nestedContainer);
+            ItemBase nestedItem = ItemBase.Cast(nestedContainer);
+            if (nestedItem)
+            {
+                nestedItem.CVCSetManagedShell(false);
+                nestedItem.CVCSetMovementLocked(false);
+                nestedItem.CVCSetActionState(ACTION_NONE);
+            }
         }
     }
 }
@@ -2589,6 +2904,8 @@ class CVCMigrationResolveHandler: CVCResponseHandler
         }
         m_State.storage_id = response.data.storage_id;
         m_State.revision = response.data.revision;
+        if (m_State.storage_id != "")
+            CVCProviderIdentityRegistry.Remember(m_State.container);
         CVCMigrationService.Prepare(m_State);
     }
     override void OnFailure(string reason) { CVCMigrationService.Fail(m_State, "container resolve failed: " + reason); }
@@ -2855,8 +3172,25 @@ class CVCMigrationService
                 Observe(container, "UNLISTED_CANDIDATE", PhysicalRootCount(container), 0, 0, "Cargo-bearing world item is blocked by the current virtual cargo container policy.");
             return;
         }
+
+        CVCContainerRuntime state = CVCContainerService.State(container);
+        if (!state || state.physical_fallback)
+            return;
+
+        if (CVCContainerService.HasPhysicalInteractionAccess(container))
+        {
+            GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(CVCMigrationService.Enqueue, 1000, false, container);
+            return;
+        }
+
         int roots = PhysicalRootCount(container);
-        if (roots > 0 && !CVCSettingsManager.Get().EnableExistingCargoMigration)
+        bool livePhysicalCargo = state.physical_interaction_pending;
+        if (roots == 0 && livePhysicalCargo)
+        {
+            CVCContainerService.ClearPhysicalInteractionPending(container);
+            return;
+        }
+        if (roots > 0 && !CVCSettingsManager.Get().EnableExistingCargoMigration && !livePhysicalCargo)
         {
             Observe(container, "PHYSICAL_FALLBACK", roots, 0, 0, "Existing physical cargo migration is disabled for this fresh-server installation.");
             CVCContainerService.EnablePhysicalFallback(container, "existing physical cargo migration is disabled");
@@ -2887,11 +3221,6 @@ class CVCMigrationService
             }
         }
 
-        CVCContainerRuntime state = CVCContainerService.State(container);
-        if (!state)
-            return;
-        if (state.physical_fallback)
-            return;
         if (state.busy || state.phase != CVCContainerService.PHASE_IDLE)
         {
             RetryContainer(container, "Container is busy with a cargo session or recovery.");
@@ -3164,6 +3493,8 @@ class CVCMigrationService
         }
         state.storage_id = migration.storage_id;
         state.revision = migration.expected_revision;
+        if (state.storage_id != "")
+            CVCProviderIdentityRegistry.Remember(container);
         if (migration.result_revision > 0)
             state.revision = migration.result_revision;
         state.busy = true;
@@ -3204,8 +3535,14 @@ class CVCMigrationService
                 Observe(state.container, status, PhysicalRootCount(state.container), 0, 0, detail);
                 if (requeue)
                     Enqueue(state.container);
-                else if (!state.physical_fallback)
-                    CVCContainerService.SetActionState(state.container, CVCContainerService.ACTION_OPEN);
+                else
+                {
+                    state.physical_interaction_pending = false;
+                    state.physical_interaction_tracking = false;
+                    state.physical_interaction_baseline = "";
+                    if (!state.physical_fallback)
+                        CVCContainerService.SetActionState(state.container, CVCContainerService.ACTION_OPEN);
+                }
             }
         }
         if (s_InFlight > 0)
@@ -3403,23 +3740,6 @@ class ActionCVCRetrySave: ActionInteractBase
     }
 }
 
-// Keep the normal barrel Open action as the entry point. Once DayZ has opened the
-// lid, Clippy opens the virtual page for eligible world barrels. Nested barrels
-// such as one inside an M3S are not eligible and keep vanilla physical cargo.
-modded class ActionOpenBarrel
-{
-    override void OnExecuteServer(ActionData action_data)
-    {
-        super.OnExecuteServer(action_data);
-        if (!action_data || !action_data.m_Target || !action_data.m_Player)
-            return;
-        Barrel_ColorBase container = Barrel_ColorBase.Cast(action_data.m_Target.GetObject());
-        if (!container || !CVCContainerPolicy.IsEligible(container) || !CVCContainerPolicy.IsNativeInteractionReady(container))
-            return;
-        CVCContainerService.Open(container, action_data.m_Player, false);
-    }
-}
-
 modded class ItemBase
 {
     protected string m_CVCVirtualItemID;
@@ -3531,14 +3851,19 @@ modded class ItemBase
 
     override bool CanReceiveItemIntoCargo(EntityAI item)
     {
-        if (GetGame().IsServer() && !CVCContainerService.AllowsPhysicalCargo(this))
-            return false;
+        if (GetGame().IsServer())
+        {
+            if (CVCContainerService.HasActivePage(this) && CVCProviderIdentityRegistry.Contains(item))
+                return false;
+            if (!CVCContainerService.AllowsPhysicalCargo(this))
+                return false;
+        }
         return super.CanReceiveItemIntoCargo(item);
     }
 
     override bool CanPutInCargo(EntityAI parent)
     {
-        if (m_CVCManagedShell)
+        if (m_CVCMovementLocked)
             return false;
         return super.CanPutInCargo(parent);
     }
@@ -3562,6 +3887,20 @@ modded class ItemBase
         if (GetGame().IsServer() && !CVCContainerService.AllowsPhysicalCargo(this))
             return false;
         return super.CanReleaseCargo(cargo);
+    }
+
+    override void EECargoIn(EntityAI item)
+    {
+        super.EECargoIn(item);
+        if (GetGame().IsServer())
+            CVCContainerService.NotePhysicalCargoChange(this);
+    }
+
+    override void EECargoOut(EntityAI item)
+    {
+        super.EECargoOut(item);
+        if (GetGame().IsServer())
+            CVCContainerService.NotePhysicalCargoChange(this);
     }
 
     override void EEDelete(EntityAI parent)
@@ -3595,11 +3934,16 @@ modded class ItemBase
             return;
         if (GetHierarchyParent())
         {
-            CVCContainerService.Unregister(this);
-            CVCMigrationService.UnregisterCandidate(this);
             CVCSetManagedShell(false);
             CVCSetMovementLocked(false);
             CVCSetActionState(CVCContainerService.ACTION_NONE);
+            if (CVCContainerService.HasUnsettledWorkflow(this))
+            {
+                CVCContainerService.SettleAfterHierarchyMove(this);
+                return;
+            }
+            CVCContainerService.Unregister(this);
+            CVCMigrationService.UnregisterCandidate(this);
             return;
         }
         CVCContainerService.Register(this);
@@ -3655,8 +3999,13 @@ modded class CarScript
 
     override bool CanReceiveItemIntoCargo(EntityAI item)
     {
-        if (GetGame().IsServer() && !CVCContainerService.AllowsPhysicalCargo(this))
-            return false;
+        if (GetGame().IsServer())
+        {
+            if (CVCContainerService.HasActivePage(this) && CVCProviderIdentityRegistry.Contains(item))
+                return false;
+            if (!CVCContainerService.AllowsPhysicalCargo(this))
+                return false;
+        }
         return super.CanReceiveItemIntoCargo(item);
     }
 
@@ -3665,6 +4014,20 @@ modded class CarScript
         if (GetGame().IsServer() && !CVCContainerService.AllowsPhysicalCargo(this))
             return false;
         return super.CanReleaseCargo(cargo);
+    }
+
+    override void EECargoIn(EntityAI item)
+    {
+        super.EECargoIn(item);
+        if (GetGame().IsServer())
+            CVCContainerService.NotePhysicalCargoChange(this);
+    }
+
+    override void EECargoOut(EntityAI item)
+    {
+        super.EECargoOut(item);
+        if (GetGame().IsServer())
+            CVCContainerService.NotePhysicalCargoChange(this);
     }
 
     override void EEDelete(EntityAI parent)
@@ -3688,6 +4051,10 @@ modded class PlayerBase
             Param1<string> openData;
             if (ctx.Read(openData) && GetGame().GetMission())
                 GetGame().GetMission().ShowInventory();
+        }
+        else if (rpc_type == CVCRPC.INVENTORY_OPEN && GetGame().IsServer())
+        {
+            CVCContainerService.InventoryOpened(this);
         }
         else if (rpc_type == CVCRPC.CLOSE_INVENTORY && GetGame().IsServer())
         {
