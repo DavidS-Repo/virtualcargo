@@ -271,7 +271,9 @@ class CVCPlayerSnapshotHandler: CVCResponseHandler
 
     override void OnFailure(string reason)
     {
-        ErrorEx("[Clippy Virtual Cargo] Player telemetry snapshot failed for " + m_PlayerID + ": " + reason);
+        // Telemetry is optional and must not create a VM-exception entry in the
+        // DayZ crash log when its endpoint is unavailable.
+        Print("[Clippy Virtual Cargo] Player telemetry snapshot skipped for " + m_PlayerID + ": " + reason + ".");
     }
 }
 
@@ -667,6 +669,7 @@ modded class MissionServer
 {
     void MissionServer()
     {
+        Print("[Clippy Virtual Cargo] Server script build " + CVCBuildInfo.Label() + " loaded.");
         if (ClippyVirtualCargoAPI.InitializeServer())
         {
             CVCContainerService.EnableEnforcement();
@@ -680,6 +683,7 @@ modded class MissionServer
     {
         super.OnInit();
         GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(CVCContainerService.Tick, 2000, true);
+        GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(CVCContainerService.ProbeNativeInventoryAccess, 250, true);
     }
 }
 
@@ -687,15 +691,25 @@ modded class MissionGameplay
 {
     protected bool m_CVCInventoryOpenApproved;
     protected bool m_CVCInventoryOpenRequested;
+    protected bool m_CVCInventoryVisibleReported;
+
+    void MissionGameplay()
+    {
+        Print("[Clippy Virtual Cargo] Client script build " + CVCBuildInfo.Label() + " loaded.");
+    }
 
     void CVCCancelInventoryOpen()
     {
         m_CVCInventoryOpenRequested = false;
+        m_CVCInventoryVisibleReported = false;
+        if (GetGame().GetUIManager().FindMenu(MENU_INVENTORY))
+            HideInventory();
     }
 
     void CVCShowInventoryApproved()
     {
         m_CVCInventoryOpenRequested = false;
+        m_CVCInventoryVisibleReported = true;
         if (GetGame().GetUIManager().FindMenu(MENU_INVENTORY))
             return;
         m_CVCInventoryOpenApproved = true;
@@ -712,10 +726,28 @@ modded class MissionGameplay
             return;
 
         int response = player.CVCConsumeInventoryOpenResponse();
-        if (response > 0)
+        if (response > 0 && m_CVCInventoryOpenRequested)
             CVCShowInventoryApproved();
-        else if (response < 0)
+        else if (response < 0 && m_CVCInventoryOpenRequested)
             CVCCancelInventoryOpen();
+
+        // Expansion and other UI mods can show or hide MENU_INVENTORY without calling
+        // MissionGameplay.ShowInventory/HideInventory. Report the actual visible menu
+        // state as a fallback so a barrel or crate that enters vicinity during that
+        // session is materialized instead of leaving its native cargo grid locked.
+        bool inventoryVisible = GetGame().GetUIManager().FindMenu(MENU_INVENTORY) != null;
+        if (inventoryVisible && !m_CVCInventoryVisibleReported && !m_CVCInventoryOpenRequested)
+        {
+            m_CVCInventoryOpenRequested = true;
+            m_CVCInventoryVisibleReported = true;
+            player.RPCSingleParam(CVCRPC.INVENTORY_OPEN, new Param1<int>(1), true, null);
+        }
+        else if (!inventoryVisible && m_CVCInventoryVisibleReported)
+        {
+            m_CVCInventoryVisibleReported = false;
+            m_CVCInventoryOpenRequested = false;
+            player.RPCSingleParam(CVCRPC.CLOSE_INVENTORY, new Param1<int>(1), true, null);
+        }
     }
 
     override void ShowInventory()
@@ -737,6 +769,7 @@ modded class MissionGameplay
     override void HideInventory()
     {
         m_CVCInventoryOpenRequested = false;
+        m_CVCInventoryVisibleReported = false;
         PlayerBase player = PlayerBase.Cast(GetGame().GetPlayer());
         if (player)
             player.RPCSingleParam(CVCRPC.CLOSE_INVENTORY, new Param1<int>(1), true, null);

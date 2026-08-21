@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.10
+
+- Fixed open ground barrels and other portable storage rejecting cargo when the client inventory signal never reached the server.
+- Added server-side native-state and proximity activation without background-opening vehicle cargo.
+- Added Bone Knife and Hand Saw support to the fire-barrel recipe.
+
+## 1.0.9
+
+- Fixed barrels and crates entering vicinity while inventory is already visible but remaining locked.
+- Added inventory visibility synchronization for Expansion and other UI mods that bypass the normal DayZ show/hide callbacks.
+- Ignored late inventory approvals after the player has already closed the menu.
+
+## 1.0.8
+
+- Fixed liquid-loaded barrels becoming non-draggable in hands when Clippy Heavy Haul 2.4 is loaded.
+- Fixed loaded barrels being blocked when moved from vehicle cargo or a truck barrel attachment.
+- Stopped automatic discovery from treating ground clothing, backpacks, and fireplaces as virtual cargo providers.
+- Prioritized newly dropped containers ahead of the startup migration queue.
+- Cancelled pre-prepare migrations when a portable container moves into hands, cargo, or an attachment.
+
+## 1.0.7
+
+- Delayed portable-provider registration until DayZ assigns the final inventory location.
+- Kept hands, cargo, and attachments outside Clippy's physical-cargo vetoes.
+- Removed the managed-shell damage-state mutation from `ItemBase`.
+- Changed expected physical fallback reports from VM exceptions to normal log entries that identify the rejected child item.
+- Added client/server build markers and optional container lifecycle diagnostics.
+
 ## 1.0.6
 
 - Removed the separate virtual-cargo inventory actions.

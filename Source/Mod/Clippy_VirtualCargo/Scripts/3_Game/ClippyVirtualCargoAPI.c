@@ -1,6 +1,6 @@
 class CVCSettings
 {
-    int Version = 7;
+    int Version = 8;
     bool Enabled = true;
     string HostURL = "http://127.0.0.1:27815";
     string ApiToken = "COPY_API_TOKEN_FROM_ClippyStorageHost.json";
@@ -25,6 +25,7 @@ class CVCSettings
     bool ReportUnlistedStorageCandidates = false;
     bool ReportEmptyUnlistedStorageCandidates = false;
     int MinimumUnlistedPhysicalRoots = 1;
+    bool EnableContainerLifecycleDiagnostics = false;
     bool EnablePlayerTelemetry = false;
     bool EnablePlayerNetworkTelemetry = true;
     bool EnablePlayerPositionTelemetry = true;

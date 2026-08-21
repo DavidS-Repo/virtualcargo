@@ -1,5 +1,5 @@
 {
-  "Version": 7,
+  "Version": 8,
   "Enabled": true,
   "HostURL": "http://127.0.0.1:27815",
   "ApiToken": "REPLACE_WITH_THE_SAME_RANDOM_TOKEN_IN_BOTH_CONFIGURATION_FILES",
@@ -23,6 +23,7 @@
   "ReportUnlistedStorageCandidates": false,
   "ReportEmptyUnlistedStorageCandidates": false,
   "MinimumUnlistedPhysicalRoots": 1,
+  "EnableContainerLifecycleDiagnostics": false,
   "ContainerClassNames": [],
   "ExcludedContainerClassNames": [
     "ClippyVirtualCargoQuarantine",
