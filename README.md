@@ -14,6 +14,8 @@ When nobody is using an eligible container, Clippy stores its cargo tree in Post
 
 Native DayZ access rules still apply. Lids, doors, locks, ownership systems, and other container rules are not bypassed.
 
+When a virtualized portable container enters hands, an attachment, or nested vehicle or storage cargo, Clippy restores its stored roots to the native DayZ cargo grid. Returning the container to top-level ground stores those roots in PostgreSQL again.
+
 ## Container scope
 
 Fresh installations can automatically discover compatible top-level entities with cargo storage. Inherited container classes and vehicle cargo are supported by the default configuration.
@@ -64,6 +66,8 @@ The Workshop mod requires the Clippy server companion on the DayZ server machine
 `START-CLIPPY-SERVER.bat` starts the managed server stack.
 
 `OPEN-CLIPPY-ADMIN.bat` opens the local Admin Panel.
+
+`STOP-CLIPPY-SERVER.bat` closes DayZ, ClippyAdminHost, ClippyStorageHost, and the configured PostgreSQL service after requesting a StorageHost backup.
 
 ## Installation
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+
+- Added hierarchy-transition materialization for portable barrels, crates, sea chests, and compatible containers. When a virtualized container enters hands, an attachment, or nested vehicle or storage cargo, Clippy restores its stored roots to the native DayZ cargo grid. Returning it to top-level ground stores those roots in PostgreSQL again.
+- Kept nested interactions on vanilla DayZ cargo rules, including drag, pickup, placement, attach, detach, and vehicle cargo movement.
+- Preserved top-level cargo coordinates, item positions, and rotations across open, close, and hierarchy changes. Invalid top-level coordinates fail closed.
+- Kept the nearby-provider recovery path for ground containers and the server-side activation path for cargo access.
+- Added `STOP-CLIPPY-SERVER.bat` and `SHUTDOWN-CLIPPY-SERVER.ps1`. The shutdown flow closes DayZ, stops the Admin Panel, asks ClippyStorageHost for a backup and graceful shutdown, then stops the configured PostgreSQL service. Forced termination requires `-Force`.
+
 ## 1.0.10
 
 - Fixed open ground barrels and other portable storage rejecting cargo when the client inventory signal never reached the server.

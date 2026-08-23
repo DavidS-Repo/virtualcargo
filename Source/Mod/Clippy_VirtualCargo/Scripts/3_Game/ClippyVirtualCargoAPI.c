@@ -544,29 +544,62 @@ class CVCIncompleteMigrationEnvelope
     ref CVCErrorData error;
 }
 
+class CVCAPIDiagnostics
+{
+    static bool IsTargetRoute(string route)
+    {
+        return route == "/v1/storage/resolve" || route == "/v1/session/open";
+    }
+
+    static void Trace(string route, string requestID, string eventName, string detail = "")
+    {
+        if (!IsTargetRoute(route))
+            return;
+        string realm = "unknown";
+        if (GetGame().IsServer())
+            realm = "server";
+        else if (GetGame().IsClient())
+            realm = "client";
+        string message = "[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString();
+        message += " realm=" + realm;
+        message += " event=REST_" + eventName;
+        message += " route=" + route;
+        message += " request_id=" + requestID;
+        message += " " + detail;
+        Print(message);
+    }
+}
+
 class CVCInternalRestCallback: RestCallback
 {
     protected ref CVCResponseHandler m_Handler;
+    protected string m_Route;
+    protected string m_RequestID;
 
-    void CVCInternalRestCallback(CVCResponseHandler handler)
+    void CVCInternalRestCallback(CVCResponseHandler handler, string route, string requestID)
     {
         m_Handler = handler;
+        m_Route = route;
+        m_RequestID = requestID;
     }
 
     override void OnSuccess(string data, int dataSize)
     {
+        CVCAPIDiagnostics.Trace(m_Route, m_RequestID, "CALLBACK_SUCCESS", "data_size=" + dataSize.ToString());
         if (m_Handler)
             m_Handler.OnSuccess(data);
     }
 
     override void OnError(int errorCode)
     {
+        CVCAPIDiagnostics.Trace(m_Route, m_RequestID, "CALLBACK_ERROR", "error_code=" + errorCode.ToString());
         if (m_Handler)
             m_Handler.OnFailure("REST error " + errorCode.ToString());
     }
 
     override void OnTimeout()
     {
+        CVCAPIDiagnostics.Trace(m_Route, m_RequestID, "CALLBACK_TIMEOUT");
         if (m_Handler)
             m_Handler.OnFailure("REST request timed out");
     }
@@ -689,12 +722,14 @@ class ClippyVirtualCargoAPI
             serialized = serializer.WriteToString(request, false, payload);
         if (!serialized)
         {
+            CVCAPIDiagnostics.Trace(route, request.request_id, "SERIALIZE_FAILED");
             handler.OnFailure("Could not serialize request");
             return false;
         }
 
-        CVCInternalRestCallback callback = new CVCInternalRestCallback(handler);
+        CVCInternalRestCallback callback = new CVCInternalRestCallback(handler, route, request.request_id);
         int state = s_Context.POST(callback, route, payload);
+        CVCAPIDiagnostics.Trace(route, request.request_id, "DISPATCH", "rest_state=" + state.ToString() + " accepted=" + (state < ERestResultState.EREST_ERROR).ToString());
         if (state >= ERestResultState.EREST_ERROR)
         {
             handler.OnFailure("REST request was rejected before dispatch");
