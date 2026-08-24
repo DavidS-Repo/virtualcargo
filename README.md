@@ -12,9 +12,10 @@ Clippy uses the container's normal DayZ cargo grid as the only player-facing inv
 
 When nobody is using an eligible container, Clippy stores its cargo tree in PostgreSQL and removes those item entities from the live world. When a player opens DayZ inventory near an accessible container, Clippy restores the stored cargo into that same native cargo grid before the inventory opens. Closing inventory, leaving range, disconnecting, or moving the container out of its world position saves the live cargo back to storage.
 
-Native DayZ access rules still apply. Lids, doors, locks, ownership systems, and other container rules are not bypassed.
+Normal DayZ access rules still apply to player interactions. During a hierarchy transition, Clippy materializes stored roots into native cargo so nested vehicle and storage cargo can use those rules.
 
 When a virtualized portable container enters hands, an attachment, or nested vehicle or storage cargo, Clippy restores its stored roots to the native DayZ cargo grid. Returning the container to top-level ground stores those roots in PostgreSQL again.
+For stored records with cargo coordinates, Clippy restores the exact cargo index, row, column, and rotation. It does not silently repack an exact record into another free slot.
 
 ## Container scope
 

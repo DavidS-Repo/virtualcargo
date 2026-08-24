@@ -32,7 +32,7 @@ class CVCStartupCoordinator
     {
         int nextAttempt = Math.Clamp(failedAttempt + 1, 1, 15);
         int delay = Math.Clamp(failedAttempt * 2000, 2000, 30000);
-        ErrorEx(string.Format("[Clippy Virtual Cargo] Storage host health check attempt %1 failed (%2); retrying in %3 ms. Cargo remains fail-closed.", failedAttempt, reason, delay));
+        Print(string.Format("[Clippy Virtual Cargo] Storage host health check attempt %1 failed (%2); retrying in %3 ms. Cargo remains fail-closed.", failedAttempt, reason, delay));
         GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(Check, delay, false, nextAttempt);
     }
 }
@@ -71,7 +71,7 @@ class CVCRecoveryCoordinator
     static void RetryOperations(int attempt, string reason)
     {
         int delay = RetryDelay(attempt);
-        ErrorEx(string.Format("[Clippy Virtual Cargo] Interrupted-operation recovery is blocked (%1). Retrying in %2 ms; migration remains disabled.", reason, delay));
+        Print(string.Format("[Clippy Virtual Cargo] Interrupted-operation recovery is blocked (%1). Retrying in %2 ms; migration remains disabled.", reason, delay));
         GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(QueryOperations, delay, false, NextAttempt(attempt));
     }
 
@@ -86,7 +86,7 @@ class CVCRecoveryCoordinator
     static void RetrySessions(int attempt, string reason)
     {
         int delay = RetryDelay(attempt);
-        ErrorEx(string.Format("[Clippy Virtual Cargo] Native-session recovery query failed (%1). Retrying in %2 ms; migration remains disabled.", reason, delay));
+        Print(string.Format("[Clippy Virtual Cargo] Native-session recovery query failed (%1). Retrying in %2 ms; migration remains disabled.", reason, delay));
         GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(QuerySessions, delay, false, NextAttempt(attempt));
     }
 
@@ -101,7 +101,7 @@ class CVCRecoveryCoordinator
     static void RetryMigrations(int attempt, string reason)
     {
         int delay = RetryDelay(attempt);
-        ErrorEx(string.Format("[Clippy Virtual Cargo] Existing-cargo recovery query failed (%1). Retrying in %2 ms; migration remains disabled.", reason, delay));
+        Print(string.Format("[Clippy Virtual Cargo] Existing-cargo recovery query failed (%1). Retrying in %2 ms; migration remains disabled.", reason, delay));
         GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(QueryMigrations, delay, false, NextAttempt(attempt));
     }
 
@@ -112,13 +112,17 @@ class CVCRecoveryCoordinator
         if (CVCContainerService.RecoverySettled())
         {
             s_Ready = true;
+            int deferredSessionCount = CVCContainerService.PendingRecoveryCount();
+            int deferredMigrationCount = CVCMigrationService.PendingRecoveryCount();
+            if (deferredSessionCount > 0 || deferredMigrationCount > 0)
+                Print("[Clippy Virtual Cargo] Deferred recovery is waiting for " + deferredSessionCount.ToString() + " unloaded session provider(s) and " + deferredMigrationCount.ToString() + " unloaded migration provider(s). Those providers remain fail-closed and recover when their matching DayZ entity registers.");
             Print("[Clippy Virtual Cargo] Recovery barrier passed. Automatic per-container SQL activation is starting.");
             CVCMigrationService.Start();
             return;
         }
 
         if (attempt == 1 || (attempt % 15) == 0)
-            ErrorEx("[Clippy Virtual Cargo] Waiting for materialized cargo sessions to recover. New migration remains fail-closed.");
+            Print("[Clippy Virtual Cargo] Waiting for materialized cargo sessions to recover. New migration remains fail-closed.");
         GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(WaitForSessions, 2000, false, attempt + 1);
     }
 }
@@ -690,7 +694,6 @@ modded class MissionServer
 
 modded class MissionGameplay
 {
-    protected bool m_CVCInventoryOpenApproved;
     protected bool m_CVCInventoryOpenRequested;
     protected bool m_CVCInventoryVisibleReported;
 
@@ -699,23 +702,10 @@ modded class MissionGameplay
         Print("[Clippy Virtual Cargo] Client script build " + CVCBuildInfo.Label() + " loaded.");
     }
 
-    void CVCCancelInventoryOpen()
+    void CVCCompleteInventoryOpenRequest()
     {
         m_CVCInventoryOpenRequested = false;
-        m_CVCInventoryVisibleReported = false;
-        if (GetGame().GetUIManager().FindMenu(MENU_INVENTORY))
-            HideInventory();
-    }
-
-    void CVCShowInventoryApproved()
-    {
-        m_CVCInventoryOpenRequested = false;
-        m_CVCInventoryVisibleReported = true;
-        if (GetGame().GetUIManager().FindMenu(MENU_INVENTORY))
-            return;
-        m_CVCInventoryOpenApproved = true;
-        ShowInventory();
-        m_CVCInventoryOpenApproved = false;
+        m_CVCInventoryVisibleReported = GetGame().GetUIManager().FindMenu(MENU_INVENTORY) != null;
     }
 
     override void OnUpdate(float timeslice)
@@ -727,10 +717,8 @@ modded class MissionGameplay
             return;
 
         int response = player.CVCConsumeInventoryOpenResponse();
-        if (response > 0 && m_CVCInventoryOpenRequested)
-            CVCShowInventoryApproved();
-        else if (response < 0 && m_CVCInventoryOpenRequested)
-            CVCCancelInventoryOpen();
+        if (response != 0 && m_CVCInventoryOpenRequested)
+            CVCCompleteInventoryOpenRequest();
 
         // Expansion and other UI mods can show or hide MENU_INVENTORY without calling
         // MissionGameplay.ShowInventory/HideInventory. Report the actual visible menu
@@ -754,19 +742,10 @@ modded class MissionGameplay
 
     override void ShowInventory()
     {
-        if (m_CVCInventoryOpenApproved)
-        {
-            super.ShowInventory();
-            return;
-        }
-
-        PlayerBase player = PlayerBase.Cast(GetGame().GetPlayer());
-        if (!player || m_CVCInventoryOpenRequested)
-            return;
-
-        m_CVCInventoryOpenRequested = true;
-        Print("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=client event=INVENTORY_OPEN_RPC_SEND origin=show_inventory identity_present=" + (player.GetIdentity() != null).ToString());
-        player.RPCSingleParam(CVCRPC.INVENTORY_OPEN, new Param1<int>(1), true, null);
+        // Keep the native Tab path responsive. OnUpdate reports the visible menu to
+        // the server, while the server keeps provider cargo locked until its SQL
+        // session has been materialized into the native grid.
+        super.ShowInventory();
     }
 
     override void HideInventory()

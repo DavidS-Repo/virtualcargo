@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.2.0
+
+- Fixes SQL-backed portable storage appearing empty when it is moved or attached to a vehicle after the server has already started.
+- Keeps the portable container's persistent Clippy provider key across the hierarchy move and uses that same key to resolve its existing PostgreSQL storage when Tab opens.
+- Materializes vehicle-contained provider roots only for the active inventory view, then commits edits and removes the temporary physical roots when the view closes.
+- Keeps `Truck_01_Base` / M3S cargo outside Clippy provider management so the truck's own cargo grid remains vanilla DayZ.
+- Requires the vehicle-contained provider's own native DayZ interaction state to be ready before materializing. M3S barrel attachments use vanilla attachment behavior, which opens the barrel, while vanilla item-count movement and detach rules stay in control.
+- Retains exact cargo index, row, column, and rotation restoration.
+
+## 1.1.9
+
+- Keeps `Truck_01_Base` / M3S cargo and attachment handling fully vanilla so Clippy cannot block normal truck cargo or force items into the top-left slot.
+- Keeps SQL-backed contents virtual while portable Clippy containers are inside or attached to vehicles, preventing barrels from becoming physically nonempty and stuck in the M3S.
+- Recovers interrupted r60 vehicle-contained sessions by committing proven physical roots back to virtual storage instead of retaining nested physical cargo.
+- Restores saved cargo index, row, column, and rotation when the portable container returns to a supported world interaction state.
+- Keeps the 1.1.8 exact-placement staging and stale-provider protections while removing vehicle-contained nested materialization.
+
+## 1.1.8
+
+- Preserves exact cargo index, row, column, and rotation when virtual roots materialize inside barrels, crates, sea chests, and other portable storage after that storage is moved into a vehicle or another cargo container.
+- Fixes the nested-container visibility regression caused by the direct inventory-location creation retry. If normal exact creation is rejected, Clippy now stages the item through DayZ's normal cargo creation path and synchronously moves that same item to the saved exact location.
+- Rejects the staged item if the exact relocation fails, so an exact record is never silently accepted in the wrong position or orientation.
+- Captures cargo orientation from DayZ's item-side `GetFlipCargo()` state and verifies index, row, column, and flip after restore.
+- Keeps native auto-placement as a final result only for legacy records with no stored cargo coordinates.
+- Prevents stale provider identities from reactivating storage classes that are not currently configured for Clippy, including normal clothing and backpacks excluded by automatic discovery.
+- Applies the same exact-preservation rules to nested child cargo and verifies attachment slots after restore.
+
+## 1.1.7
+
+- Fixed nested materialization rolling back a successfully restored root only because a closed barrel, crate, sea chest, or similar portable container reported its native parent receive/release gate as closed while inside vehicle or storage cargo.
+- Kept the root item movement checks strict while deferring only the closed nested parent's receive/release gate during Clippy's internal restore.
+
+## 1.1.6
+
+- Starts normal container activation after loaded recovery sessions settle. Recovery records without a matching live provider stay queued and fail-closed until that provider registers.
+- Lets Tab open the native DayZ inventory without waiting for an inventory RPC reply. Provider cargo still rejects item movement until its SQL session is active.
+- Extends opt-in lifecycle diagnostics to eligible ammo crates and modded storage containers.
+
+## 1.1.5
+
+- Limits Tab inventory preparation to nearby eligible providers, avoiding unrelated registered containers and reducing repeated policy work.
+- Keeps expected recovery waits in ordinary server diagnostics instead of the script-error path.
+- Keeps transient host-health and recovery-query retries out of the script-error path while retaining errors for terminal safety failures.
+- Holds nested restored roots in native cargo while DayZ assigns their persistence identities, then records the SQL session.
+
+## 1.1.3
+
+- Fixed nested portable-container restoration when DayZ rejects the saved cargo slot inside vehicle or storage cargo. Clippy now falls back to native auto-placement for that nested transition while keeping strict saved-position restoration for top-level ground containers.
+
+## 1.1.2
+
+- Fixed virtualized barrel, crate, and sea chest contents not appearing after a portable container enters vehicle or storage cargo. Nested materialization now completes without requiring the container's ground interaction state, and internal restoration remains permitted by the virtual-cargo guard.
+- Removed Clippy diagnostic status notices from the player-facing UI while retaining server-side diagnostics.
+
+## 1.1.1
+
+- Fixed a DayZ script compile error in the inventory access path that prevented the Workshop mod from loading.
+
 ## 1.1.0
 
 - Added hierarchy-transition materialization for portable barrels, crates, sea chests, and compatible containers. When a virtualized container enters hands, an attachment, or nested vehicle or storage cargo, Clippy restores its stored roots to the native DayZ cargo grid. Returning it to top-level ground stores those roots in PostgreSQL again.
@@ -12,7 +70,6 @@
 
 - Fixed open ground barrels and other portable storage rejecting cargo when the client inventory signal never reached the server.
 - Added server-side native-state and proximity activation without background-opening vehicle cargo.
-- Added Bone Knife and Hand Saw support to the fire-barrel recipe.
 
 ## 1.0.9
 
@@ -22,8 +79,7 @@
 
 ## 1.0.8
 
-- Fixed liquid-loaded barrels becoming non-draggable in hands when Clippy Heavy Haul 2.4 is loaded.
-- Fixed loaded barrels being blocked when moved from vehicle cargo or a truck barrel attachment.
+ - Fixed loaded barrels being blocked when moved from vehicle cargo or a truck barrel attachment.
 - Stopped automatic discovery from treating ground clothing, backpacks, and fireplaces as virtual cargo providers.
 - Prioritized newly dropped containers ahead of the startup migration queue.
 - Cancelled pre-prepare migrations when a portable container moves into hands, cargo, or an attachment.
