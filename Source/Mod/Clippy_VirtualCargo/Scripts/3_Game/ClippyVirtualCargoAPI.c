@@ -11,6 +11,7 @@ class CVCSettings
     int NativePageSize = 20;
     int MaterializationIntervalMs = 1;
     float AccessDistanceMetres = 2.0;
+    float VehicleAccessDistanceMetres = 10.0;
     bool AutoOpenInventory = true;
     bool RejectContaminatedItems = true;
     bool RejectActiveOrPluggedItems = true;
@@ -85,6 +86,13 @@ class CVCSettingsManager
             return false;
         }
         s_Settings = loaded;
+        if (s_Settings.VehicleAccessDistanceMetres <= 0)
+        {
+            s_Settings.VehicleAccessDistanceMetres = 10.0;
+            string upgradeError;
+            JsonFileLoader<CVCSettings>.SaveFile(FILE, s_Settings, upgradeError);
+            ErrorEx("[Clippy Virtual Cargo] Settings.json predated VehicleAccessDistanceMetres; added it with a default of 10.0.");
+        }
         if (!s_Settings.Enabled)
         {
             Print("[Clippy Virtual Cargo] Disabled in Settings.json.");
@@ -553,6 +561,8 @@ class CVCAPIDiagnostics
 
     static void Trace(string route, string requestID, string eventName, string detail = "")
     {
+        if (!CVCSettingsManager.Get().EnableContainerLifecycleDiagnostics)
+            return;
         if (!IsTargetRoute(route))
             return;
         string realm = "unknown";

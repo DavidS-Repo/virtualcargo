@@ -688,7 +688,7 @@ modded class MissionServer
         super.OnInit();
         GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(CVCContainerService.Tick, 2000, true);
         GetGame().GetCallQueue(CALL_CATEGORY_SYSTEM).CallLater(CVCContainerService.ProbeNativeInventoryAccess, 250, true);
-        Print("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=server event=PROBE_TIMER_SCHEDULED interval_ms=250 repeat=true");
+        CVCContainerDiagnostics.TraceGlobal("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=server event=PROBE_TIMER_SCHEDULED interval_ms=250 repeat=true");
     }
 }
 
@@ -729,7 +729,7 @@ modded class MissionGameplay
         {
             m_CVCInventoryOpenRequested = true;
             m_CVCInventoryVisibleReported = true;
-            Print("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=client event=INVENTORY_OPEN_RPC_SEND origin=visible_menu_fallback identity_present=" + (player.GetIdentity() != null).ToString());
+            CVCContainerDiagnostics.TraceGlobal("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=client event=INVENTORY_OPEN_RPC_SEND origin=visible_menu_fallback identity_present=" + (player.GetIdentity() != null).ToString());
             player.RPCSingleParam(CVCRPC.INVENTORY_OPEN, new Param1<int>(1), true, null);
         }
         else if (!inventoryVisible && m_CVCInventoryVisibleReported)

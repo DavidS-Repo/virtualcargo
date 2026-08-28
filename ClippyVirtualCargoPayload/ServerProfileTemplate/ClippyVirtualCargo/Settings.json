@@ -9,6 +9,7 @@
   "VirtualRootCapacity": 10000,
   "NativePageSize": 20,
   "AccessDistanceMetres": 2.0,
+  "VehicleAccessDistanceMetres": 10.0,
   "AutoOpenInventory": true,
   "RejectContaminatedItems": true,
   "RejectActiveOrPluggedItems": true,

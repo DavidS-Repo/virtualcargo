@@ -1,6 +1,6 @@
 class CVCBuildInfo
 {
-    static const string VERSION = "1.2.0";
+    static const string VERSION = "1.2.1";
     static const int MAINTAINER_REVISION = 62;
 
     static string Label()
@@ -1045,7 +1045,7 @@ class CVCContainerPolicy
             return false;
         if (entity.IsKindOf("PlayerBase") || Matches(entity, settings.ExcludedContainerClassNames, true))
             return false;
-        // 1.2.0-r62: keep the vanilla M3S inventory completely outside Clippy.
+        // 1.1.9-r61: keep the vanilla M3S inventory completely outside Clippy.
         // M3S has special container/material attachment rules and r60 could leave
         // its main cargo fail-closed while portable providers were transitioning.
         if (entity.IsKindOf("Truck_01_Base"))
@@ -1190,6 +1190,8 @@ class CVCContainerDiagnostics
 
     static void TracePortable(EntityAI entity, string eventName, string detail, int intervalMs = 1000)
     {
+        if (!CVCSettingsManager.Get().EnableContainerLifecycleDiagnostics)
+            return;
         if (!IsPortableTarget(entity))
             return;
         string diagnosticProviderKey = CVCContainerPolicy.ProviderKey(entity);
@@ -1215,6 +1217,13 @@ class CVCContainerDiagnostics
         diagnosticMessage += " provider=" + diagnosticProviderKey;
         diagnosticMessage += " " + detail;
         Print(diagnosticMessage);
+    }
+
+    static void TraceGlobal(string message)
+    {
+        if (!CVCSettingsManager.Get().EnableContainerLifecycleDiagnostics)
+            return;
+        Print(message);
     }
 
     static void Trace(ItemBase item, string eventName, EntityAI oldOwner = null, EntityAI newOwner = null)
@@ -1288,7 +1297,6 @@ class CVCContainerRuntime
     bool recovery_exact_page;
     bool abort_pending;
     bool nested_materialization;
-    bool vehicle_inventory_materialization;
     int abort_retry_attempt;
     int cleanup_retry_attempt;
     bool cleanup_committed;
@@ -1873,6 +1881,7 @@ class CVCContainerService
     protected static bool s_EnforcementReady;
     protected static bool s_DiagnosticProbeFirstTick;
     protected static string s_DiagnosticProbeGuards;
+    protected static int s_DiagnosticVehicleScanMs;
     protected static ref map<PlayerBase, int> s_LastNearbyDiscoveryMs = new map<PlayerBase, int>;
 
     protected static string DiagnosticRuntime(CVCContainerRuntime state)
@@ -1887,7 +1896,6 @@ class CVCContainerService
         diagnosticRuntime += " native_blocked=" + state.native_inventory_blocked.ToString();
         diagnosticRuntime += " native_block_reason=" + state.native_inventory_block_reason;
         diagnosticRuntime += " nested_materialization=" + state.nested_materialization.ToString();
-        diagnosticRuntime += " vehicle_inventory_materialization=" + state.vehicle_inventory_materialization.ToString();
         diagnosticRuntime += " session_present=" + (state.session_id != "").ToString();
         diagnosticRuntime += " active_migration=" + (state.active_migration != null).ToString();
         diagnosticRuntime += " migration_prepared=" + state.migration_prepare_dispatched.ToString();
@@ -2290,11 +2298,8 @@ class CVCContainerService
         if (s_PendingRecovery.Find(key, recovery))
         {
             SetActionState(container, ACTION_NONE);
-            if (persistentPhysicalLocation && existing)
-            {
-                existing.vehicle_inventory_materialization = false;
-                existing.nested_materialization = !CVCContainerPolicy.IsVehicleContainmentLocation(container);
-            }
+            if (persistentPhysicalLocation)
+                existing.nested_materialization = true;
             s_PendingRecovery.Remove(key);
             StartRecovery(container, recovery);
             return true;
@@ -2303,10 +2308,7 @@ class CVCContainerService
         if (persistentPhysicalLocation)
         {
             if (existing)
-            {
-                existing.vehicle_inventory_materialization = false;
-                existing.nested_materialization = !CVCContainerPolicy.IsVehicleContainmentLocation(container);
-            }
+                existing.nested_materialization = true;
             SetActionState(container, ACTION_NONE);
         }
         else if (CVCMigrationService.IsStarted() && existing && !existing.busy && !existing.recovering && !existing.physical_fallback && existing.phase == PHASE_IDLE && PhysicalRootCount(container) == 0)
@@ -2345,8 +2347,6 @@ class CVCContainerService
             s_Registered.Remove(key);
         if (!stateFound || !state)
             return;
-        state.vehicle_inventory_materialization = false;
-        state.nested_materialization = false;
         state.container = null;
         state.physical_interaction_tracking = false;
         state.physical_interaction_baseline = "";
@@ -2529,6 +2529,60 @@ class CVCContainerService
         return discoveredCount;
     }
 
+    protected static void RegisterVehicleContainerCandidate(EntityAI container)
+    {
+        if (!container)
+            return;
+        bool vehicleContainment = CVCContainerPolicy.IsVehicleContainmentLocation(container);
+        bool configuredClass = CVCContainerPolicy.IsConfiguredContainerClass(container);
+        bool knownProvider = CVCProviderIdentityRegistry.Contains(container);
+        if (CVCContainerDiagnostics.IsPortableTarget(container))
+            CVCContainerDiagnostics.TracePortable(container, "VEHICLE_CANDIDATE_SCAN", "vehicle_containment=" + vehicleContainment.ToString() + " configured_class=" + configuredClass.ToString() + " known_provider=" + knownProvider.ToString(), 1000);
+        if (!vehicleContainment || !configuredClass || !knownProvider)
+            return;
+        bool registered = Register(container);
+        if (!registered)
+        {
+            CVCContainerDiagnostics.TracePortable(container, "VEHICLE_CANDIDATE_REGISTER_FAILED", "result=refused", 1000);
+            return;
+        }
+        CVCContainerRuntime state = State(container);
+        if (state)
+            TryStartNestedMaterialization(state);
+    }
+
+    protected static void DiscoverNearbyVehicleContainers(PlayerBase player)
+    {
+        if (!GetGame().IsServer() || !player || !player.GetIdentity() || !player.IsAlive())
+            return;
+        float searchRadius = CVCSettingsManager.Get().VehicleAccessDistanceMetres;
+        ref array<Object> nearbyObjects = new array<Object>;
+        ref array<CargoBase> proxyCargos = new array<CargoBase>;
+        GetGame().GetObjectsAtPosition3D(player.GetPosition(), searchRadius, nearbyObjects, proxyCargos);
+        int vehiclesFound;
+        foreach (Object nearbyObject : nearbyObjects)
+        {
+            Transport vehicle = Transport.Cast(nearbyObject);
+            if (!vehicle || !vehicle.GetInventory())
+                continue;
+            vehiclesFound++;
+            GameInventory vehicleInventory = vehicle.GetInventory();
+            for (int attachmentIndex = 0; attachmentIndex < vehicleInventory.AttachmentCount(); attachmentIndex++)
+                RegisterVehicleContainerCandidate(EntityAI.Cast(vehicleInventory.GetAttachmentFromIndex(attachmentIndex)));
+            CargoBase vehicleCargo = vehicleInventory.GetCargo();
+            if (!vehicleCargo)
+                continue;
+            for (int cargoIndex = 0; cargoIndex < vehicleCargo.GetItemCount(); cargoIndex++)
+                RegisterVehicleContainerCandidate(EntityAI.Cast(vehicleCargo.GetItem(cargoIndex)));
+        }
+        int diagnosticVehicleScanNowMs = GetGame().GetTime();
+        if (diagnosticVehicleScanNowMs - s_DiagnosticVehicleScanMs >= 1000)
+        {
+            s_DiagnosticVehicleScanMs = diagnosticVehicleScanNowMs;
+            CVCContainerDiagnostics.TraceGlobal("[CVC-DIAG] t_ms=" + diagnosticVehicleScanNowMs.ToString() + " realm=server event=VEHICLE_DISCOVERY_SCAN search_radius=" + searchRadius.ToString() + " vehicles_found=" + vehiclesFound.ToString() + " objects_seen=" + nearbyObjects.Count().ToString());
+        }
+    }
+
     static void InventoryOpened(PlayerBase player)
     {
         if (!GetGame().IsServer() || !player)
@@ -2538,6 +2592,7 @@ class CVCContainerService
         // The RPC is already protected by s_InventoryPreparingPlayers. Do not let a
         // probe that ran just before a drop suppress discovery at the actual UI edge.
         DiscoverNearbyWorldProviders(player, "inventory_rpc", 0);
+        DiscoverNearbyVehicleContainers(player);
         s_InventoryPreparingPlayers.Insert(player);
         PrepareInventoryOpen(player, GetGame().GetTime());
     }
@@ -2652,10 +2707,13 @@ class CVCContainerService
     {
         if (!container)
             return null;
+        float searchDistance = CVCSettingsManager.Get().AccessDistanceMetres;
+        if (CVCContainerPolicy.IsVehicleContainmentLocation(container))
+            searchDistance = CVCSettingsManager.Get().VehicleAccessDistanceMetres;
         ref array<Man> players = new array<Man>;
         GetGame().GetPlayers(players);
         PlayerBase nearestPlayer;
-        float nearestDistance = CVCSettingsManager.Get().AccessDistanceMetres + 1.0;
+        float nearestDistance = searchDistance + 1.0;
         foreach (Man man : players)
         {
             PlayerBase player = PlayerBase.Cast(man);
@@ -2669,95 +2727,6 @@ class CVCContainerService
             }
         }
         return nearestPlayer;
-    }
-
-    protected static bool IsInventoryOpenForPlayer(PlayerBase player)
-    {
-        return player && s_InventoryOpenPlayers.Find(player) >= 0;
-    }
-
-    protected static PlayerBase FindOpenInventoryPlayer(EntityAI container)
-    {
-        if (!container)
-            return null;
-        PlayerBase nearestPlayer;
-        float nearestDistance = CVCSettingsManager.Get().AccessDistanceMetres + 1.0;
-        foreach (PlayerBase player : s_InventoryOpenPlayers)
-        {
-            if (!player || !player.GetIdentity() || !player.IsAlive())
-                continue;
-            float distance = vector.Distance(player.GetPosition(), container.GetPosition());
-            if (distance < nearestDistance)
-            {
-                nearestDistance = distance;
-                nearestPlayer = player;
-            }
-        }
-        return nearestPlayer;
-    }
-
-    protected static void TryStartVehicleInventoryMaterialization(CVCContainerRuntime state, PlayerBase player)
-    {
-        if (!GetGame().IsServer() || !state || !state.container || !player || !player.GetIdentity() || !player.IsAlive())
-            return;
-        if (!CVCContainerPolicy.IsVehicleContainmentLocation(state.container))
-            return;
-        if (!CVCContainerPolicy.IsConfiguredContainerClass(state.container) || !CVCProviderIdentityRegistry.Contains(state.container))
-            return;
-        if (!CVCContainerPolicy.IsNativeInteractionReady(state.container))
-        {
-            CVCContainerDiagnostics.TracePortable(state.container, "VEHICLE_INVENTORY_NATIVE_NOT_READY", "result=defer_until_native_container_ready " + DiagnosticRuntime(state), 250);
-            return;
-        }
-        if (vector.Distance(player.GetPosition(), state.container.GetPosition()) > CVCSettingsManager.Get().AccessDistanceMetres)
-            return;
-        if (state.physical_fallback || state.native_inventory_blocked || state.recovering || state.active_migration != null || state.migration_prepare_dispatched)
-            return;
-        if (state.phase == PHASE_ACTIVE || state.busy || state.session_id != "" || state.phase != PHASE_IDLE)
-            return;
-
-        int physicalRoots = PhysicalRootCount(state.container);
-        if (physicalRoots > 0)
-        {
-            CVCContainerDiagnostics.TracePortable(state.container, "VEHICLE_INVENTORY_NATIVE_ROOTS_PRESENT", "result=leave_physical_roots physical_roots=" + physicalRoots.ToString() + " " + DiagnosticRuntime(state), 250);
-            return;
-        }
-        state.nested_materialization = true;
-        state.vehicle_inventory_materialization = true;
-        state.player = player;
-        state.busy = true;
-        state.phase = PHASE_OPENING;
-        SetActionState(state.container, ACTION_NONE);
-        CVCContainerDiagnostics.TracePortable(state.container, "VEHICLE_INVENTORY_MATERIALIZATION_REQUEST", "result=dispatch player_present=true " + DiagnosticRuntime(state), 250);
-        if (state.storage_id == "")
-        {
-            CVCResolveRequest request = new CVCResolveRequest;
-            request.provider_id = CVCSettingsManager.Get().ProviderID;
-            request.provider_key = state.provider_key;
-            request.display_name = state.container.GetDisplayName();
-            request.capacity_slots = CVCSettingsManager.Get().VirtualRootCapacity;
-            CVCContainerMetadata.FillResolve(request, state.container);
-            bool dispatched = ClippyVirtualCargoAPI.Post("/v1/storage/resolve", request, new CVCNativeResolveHandler(state, false));
-            DiagnosticRoute(state, "/v1/storage/resolve", "VEHICLE_INVENTORY_RESOLVE_DISPATCH", "accepted=" + dispatched.ToString());
-            if (!dispatched)
-                OpenUncertain(state, "could not dispatch vehicle-contained cargo resolve; restart recovery is required");
-            return;
-        }
-        OpenResolved(state, false);
-    }
-
-    protected static void PrepareVehicleProvidersForInventory(PlayerBase player)
-    {
-        if (!GetGame().IsServer() || !player || !player.GetIdentity() || !player.IsAlive())
-            return;
-        foreach (string providerKey, CVCContainerRuntime state : s_States)
-        {
-            if (!state || !state.container || state.provider_key != providerKey)
-                continue;
-            if (!CVCContainerPolicy.IsVehicleContainmentLocation(state.container))
-                continue;
-            TryStartVehicleInventoryMaterialization(state, player);
-        }
     }
 
     protected static bool PrepareContainerForNativeInventory(EntityAI container, PlayerBase player)
@@ -2868,12 +2837,12 @@ class CVCContainerService
         if (!s_DiagnosticProbeFirstTick)
         {
             s_DiagnosticProbeFirstTick = true;
-            Print("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=server event=PROBE_FIRST_TICK " + diagnosticGuards);
+            CVCContainerDiagnostics.TraceGlobal("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=server event=PROBE_FIRST_TICK " + diagnosticGuards);
         }
         if (diagnosticGuards != s_DiagnosticProbeGuards)
         {
             s_DiagnosticProbeGuards = diagnosticGuards;
-            Print("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=server event=PROBE_GLOBAL_GATES " + diagnosticGuards);
+            CVCContainerDiagnostics.TraceGlobal("[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString() + " realm=server event=PROBE_GLOBAL_GATES " + diagnosticGuards);
         }
         if (!diagnosticIsServer)
             return;
@@ -2894,7 +2863,7 @@ class CVCContainerService
             diagnosticDiscoveredCount += DiscoverNearbyWorldProviders(diagnosticDiscoveryPlayer, "server_probe", 1000);
         }
         if (diagnosticDiscoveredCount > 0)
-            Print("[CVC-DIAG] t_ms=" + diagnosticDiscoveryNowMs.ToString() + " realm=server event=NEARBY_DISCOVERY_SUMMARY origin=server_probe registered=" + diagnosticDiscoveredCount.ToString());
+            CVCContainerDiagnostics.TraceGlobal("[CVC-DIAG] t_ms=" + diagnosticDiscoveryNowMs.ToString() + " realm=server event=NEARBY_DISCOVERY_SUMMARY origin=server_probe registered=" + diagnosticDiscoveredCount.ToString());
 
         foreach (string providerKey, EntityAI container : s_Registered)
         {
@@ -3017,15 +2986,6 @@ class CVCContainerService
                 PrepareContainerForNativeInventory(container, player);
             }
         }
-
-        // 1.2.0: portable providers keep the same persistent provider key when they
-        // move into a vehicle. They are not world providers there, so prepare them
-        // explicitly from the registered runtime map when Tab opens. The physical
-        // roots exist only while the player's inventory is open and are committed
-        // back to PostgreSQL when that view closes.
-        if (ClippyVirtualCargoAPI.IsReady() && s_EnforcementReady && CVCMigrationService.IsStarted())
-            PrepareVehicleProvidersForInventory(player);
-
         ApproveInventoryOpen(player);
     }
 
@@ -3119,7 +3079,7 @@ class CVCContainerService
     {
         if (!container)
             return true;
-        // M3S cargo is always vanilla in r62. Never let a stale Clippy runtime,
+        // M3S cargo is always vanilla in r61. Never let a stale Clippy runtime,
         // recovery record, or migration state veto its normal cargo grid.
         if (container.IsKindOf("Truck_01_Base"))
             return DiagnosticCargoDecision(container, null, true, "m3s_vanilla_boundary");
@@ -3178,6 +3138,19 @@ class CVCContainerService
         return DiagnosticCargoDecision(container, state, false, "no_active_authorized_materialized_session");
     }
 
+    static bool AllowsAttachmentRelease(EntityAI attachment)
+    {
+        if (!attachment || !CVCContainerPolicy.IsConfiguredContainerClass(attachment))
+            return true;
+        string key = CVCContainerPolicy.ProviderKey(attachment);
+        if (key == "")
+            return true;
+        CVCContainerRuntime state;
+        if (!s_States.Find(key, state) || !state || state.container != attachment)
+            return true;
+        return state.phase == PHASE_IDLE;
+    }
+
     static bool HasUnsettledWorkflow(EntityAI container)
     {
         if (!GetGame().IsServer() || !container)
@@ -3205,19 +3178,16 @@ class CVCContainerService
             // Materializing here made an attached barrel impossible to remove.
             if (CVCContainerPolicy.IsVehicleContainmentLocation(container))
             {
-                state.vehicle_inventory_materialization = false;
-                state.nested_materialization = false;
+                state.nested_materialization = true;
                 if (state.phase == PHASE_ACTIVE && state.session_id != "" && !state.busy)
                     Commit(state);
                 CVCContainerDiagnostics.TracePortable(container, "VEHICLE_BOUNDARY_KEEP_VIRTUAL", "result=vanilla_container_shell physical_roots=" + PhysicalRootCount(container).ToString() + " " + DiagnosticRuntime(state), 250);
                 return;
             }
-            state.vehicle_inventory_materialization = false;
             state.nested_materialization = true;
             TryStartNestedMaterialization(state);
             return;
         }
-        state.vehicle_inventory_materialization = false;
         state.nested_materialization = false;
         if (state.phase == PHASE_ACTIVE && state.session_id != "" && !state.busy)
             Commit(state);
@@ -3231,7 +3201,6 @@ class CVCContainerService
         CVCContainerRuntime state;
         if (key == "" || !s_States.Find(key, state) || !state || state.container != container)
             return;
-        state.vehicle_inventory_materialization = false;
         state.nested_materialization = false;
     }
 
@@ -3240,8 +3209,6 @@ class CVCContainerService
         if (!GetGame().IsServer() || !state || !state.container || !state.nested_materialization)
             return;
         if (!CVCContainerPolicy.IsPhysicalInteractionLocation(state.container))
-            return;
-        if (CVCContainerPolicy.IsVehicleContainmentLocation(state.container))
             return;
         if (state.phase != PHASE_IDLE || state.busy || state.recovering || state.physical_fallback || state.session_id != "" || state.active_migration != null || state.migration_prepare_dispatched)
             return;
@@ -3299,8 +3266,6 @@ class CVCContainerService
         state.busy = false;
         state.phase = PHASE_IDLE;
         state.player = null;
-        state.vehicle_inventory_materialization = false;
-        state.nested_materialization = false;
         state.migration_retries = 0;
         state.physical_interaction_pending = false;
         state.physical_interaction_tracking = false;
@@ -3562,13 +3527,7 @@ class CVCContainerService
         {
             if (state && state.player == player && state.phase == PHASE_ACTIVE)
             {
-                if (state.vehicle_inventory_materialization)
-                {
-                    state.vehicle_inventory_materialization = false;
-                    state.nested_materialization = false;
-                    Commit(state);
-                }
-                else if (state.nested_materialization && CVCContainerPolicy.IsPhysicalInteractionLocation(state.container))
+                if (state.nested_materialization && CVCContainerPolicy.IsPhysicalInteractionLocation(state.container))
                     state.player = null;
                 else
                     Commit(state);
@@ -3608,7 +3567,6 @@ class CVCContainerService
         state.busy = false;
         state.recovering = true;
         state.physical_fallback = false;
-        state.vehicle_inventory_materialization = false;
         state.nested_materialization = CVCContainerPolicy.IsPhysicalInteractionLocation(container) && !CVCContainerPolicy.IsVehicleContainmentLocation(container);
         state.recovery_session = recovery;
         state.pending_mark_root_ids.Clear();
@@ -3942,6 +3900,7 @@ class CVCContainerService
         state.mark_request_prepared = false;
         state.busy = false;
         state.phase = PHASE_ACTIVE;
+
         if (state.recovering)
         {
             if (!state.recovery_exact_page)
@@ -4190,8 +4149,6 @@ class CVCContainerService
         state.mark_request_prepared = false;
         state.pending_failure_reason = "";
         state.player = null;
-        state.vehicle_inventory_materialization = false;
-        state.nested_materialization = false;
         CompleteRecovery(state);
         if (state.next_cursor != "")
             SetActionState(state.container, ACTION_NEXT);
@@ -4354,8 +4311,6 @@ class CVCContainerService
         state.mark_request_prepared = false;
         state.pending_cleanup_source_keys.Clear();
         state.player = null;
-        state.vehicle_inventory_materialization = false;
-        state.nested_materialization = false;
         CompleteRecovery(state);
         if (state.next_cursor != "")
             SetActionState(state.container, ACTION_NEXT);
@@ -4380,8 +4335,6 @@ class CVCContainerService
         state.busy = false;
         state.phase = PHASE_IDLE;
         state.player = null;
-        state.vehicle_inventory_materialization = false;
-        state.nested_materialization = false;
         if (state.next_cursor != "")
             SetActionState(state.container, ACTION_NEXT);
         else
@@ -4409,6 +4362,7 @@ class CVCContainerService
                     continue;
                 PrepareContainerForNativeInventory(openContainer, inventoryPlayer);
             }
+            DiscoverNearbyVehicleContainers(inventoryPlayer);
         }
 
         FlushPendingPhysicalInteractions();
@@ -4424,26 +4378,15 @@ class CVCContainerService
                 {
                     if (CVCContainerPolicy.IsVehicleContainmentLocation(state.container))
                     {
-                        PlayerBase vehicleViewer = FindOpenInventoryPlayer(state.container);
-                        if (state.phase == PHASE_ACTIVE && state.session_id != "" && !state.busy)
-                        {
-                            if (state.vehicle_inventory_materialization && state.player && IsInventoryOpenForPlayer(state.player))
-                                continue;
-                            state.vehicle_inventory_materialization = false;
-                            state.nested_materialization = false;
+                        bool stillResponsible = state.player && state.player.IsAlive() && state.player.GetIdentity();
+                        if (state.phase == PHASE_ACTIVE && state.session_id != "" && !state.busy && !stillResponsible)
                             Commit(state);
-                            continue;
-                        }
-                        if (!state.busy && !state.recovering && state.phase == PHASE_IDLE && state.session_id == "" && vehicleViewer)
-                            TryStartVehicleInventoryMaterialization(state, vehicleViewer);
                         continue;
                     }
-                    state.vehicle_inventory_materialization = false;
                     state.nested_materialization = true;
                     TryStartNestedMaterialization(state);
                     continue;
                 }
-                state.vehicle_inventory_materialization = false;
                 state.nested_materialization = false;
                 if (state.phase == PHASE_ACTIVE && state.session_id != "" && !state.busy)
                     Commit(state);
@@ -4451,7 +4394,6 @@ class CVCContainerService
                     settledNested.Insert(state.container);
                 continue;
             }
-            state.vehicle_inventory_materialization = false;
             state.nested_materialization = false;
             if (state.phase == PHASE_ACTIVE && (!state.player || !CVCContainerPolicy.CanAccess(state.container, state.player)))
             {
@@ -5658,7 +5600,6 @@ modded class ItemBase
     }
 }
 
-
 modded class CarScript
 {
     protected int m_CVCActionState;
@@ -5707,6 +5648,13 @@ modded class CarScript
         if (GetGame().IsServer() && !CVCContainerService.AllowsPhysicalCargo(this))
             return false;
         return super.CanReleaseCargo(cargo);
+    }
+
+    override bool CanReleaseAttachment(EntityAI attachment)
+    {
+        if (GetGame().IsServer() && !CVCContainerService.AllowsAttachmentRelease(attachment))
+            return false;
+        return super.CanReleaseAttachment(attachment);
     }
 
     override void EECargoIn(EntityAI item)
@@ -5758,7 +5706,7 @@ modded class PlayerBase
                 string diagnosticRPCReply = "[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString();
                 diagnosticRPCReply += " realm=client event=INVENTORY_OPEN_RPC_REPLY value=";
                 diagnosticRPCReply += openData.param1;
-                Print(diagnosticRPCReply);
+                CVCContainerDiagnostics.TraceGlobal(diagnosticRPCReply);
                 if (openData.param1 == "native")
                     m_CVCInventoryOpenResponse = 1;
                 else
@@ -5768,7 +5716,7 @@ modded class PlayerBase
             {
                 string diagnosticRPCReadFailure = "[CVC-DIAG] t_ms=" + GetGame().GetTime().ToString();
                 diagnosticRPCReadFailure += " realm=client event=INVENTORY_OPEN_RPC_REPLY value=read_failed";
-                Print(diagnosticRPCReadFailure);
+                CVCContainerDiagnostics.TraceGlobal(diagnosticRPCReadFailure);
                 m_CVCInventoryOpenResponse = -1;
             }
         }
@@ -5779,7 +5727,7 @@ modded class PlayerBase
             diagnosticRPCReceipt += " sender_present=" + (sender != null).ToString();
             diagnosticRPCReceipt += " player_identity_present=" + (GetIdentity() != null).ToString();
             diagnosticRPCReceipt += " alive=" + IsAlive().ToString();
-            Print(diagnosticRPCReceipt);
+            CVCContainerDiagnostics.TraceGlobal(diagnosticRPCReceipt);
             CVCContainerService.InventoryOpened(this);
         }
         else if (rpc_type == CVCRPC.CLOSE_INVENTORY && GetGame().IsServer())

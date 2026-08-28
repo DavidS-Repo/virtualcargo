@@ -1,13 +1,15 @@
 # Changelog
 
-## 1.2.0
+## 1.2.1
 
-- Fixes SQL-backed portable storage appearing empty when it is moved or attached to a vehicle after the server has already started.
-- Keeps the portable container's persistent Clippy provider key across the hierarchy move and uses that same key to resolve its existing PostgreSQL storage when Tab opens.
-- Materializes vehicle-contained provider roots only for the active inventory view, then commits edits and removes the temporary physical roots when the view closes.
-- Keeps `Truck_01_Base` / M3S cargo outside Clippy provider management so the truck's own cargo grid remains vanilla DayZ.
-- Requires the vehicle-contained provider's own native DayZ interaction state to be ready before materializing. M3S barrel attachments use vanilla attachment behavior, which opens the barrel, while vanilla item-count movement and detach rules stay in control.
-- Retains exact cargo index, row, column, and rotation restoration.
+- Fixed portable containers (barrels, crates, sea chests) showing empty after being attached to a vehicle. r61 kept vehicle-attached containers permanently virtual with no remaining path to materialize their stored contents, so opening one in a vehicle never restored its SQL-backed cargo.
+- Restores hierarchy materialization for vehicle-attached containers, driven only by a player explicitly opening their inventory nearby (Tab), never by passive proximity or a driving/moving vehicle. Discovery walks the nearby vehicle's own attachments and cargo directly (new `VehicleAccessDistanceMetres` setting, default 10m), so a container's mounting position on a larger vehicle like the M3S no longer matters.
+- A materialized vehicle-attached container now stays open for as long as the interacting player's inventory remains open, then auto-commits back to virtual storage once they close it, die, or disconnect.
+- Adds a new attachment-release guard (`CanReleaseAttachment` on `CarScript`) that blocks detaching a Clippy-managed container from a vehicle while its materialized session is still active, closing the r60 "barrel stuck in the M3S" failure mode that r61 previously worked around by disabling materialization entirely.
+- `LoadServer()` now validates `VehicleAccessDistanceMetres` on load and repairs it to a safe default if missing, so upgrading an existing `Settings.json` picks up the new setting automatically.
+- Added diagnostics (`VEHICLE_DISCOVERY_SCAN`, `VEHICLE_CANDIDATE_SCAN`, `VEHICLE_CANDIDATE_REGISTER_FAILED`) covering the vehicle-attached discovery and registration path.
+- Fixed most `[CVC-DIAG]` tracing printing regardless of the `EnableContainerLifecycleDiagnostics` setting. That setting already defaulted to `false`, but only 2 of the roughly 65 trace call sites checked it; the rest, including the per-tick `PROBE_PROVIDER_GATES`/`PROBE_RUNTIME_GATES` lines, printed unconditionally. A production server previously had no way to turn this off. All entity-scoped tracing now runs through `TracePortable`, and everything else through a new `TraceGlobal` helper, both of which check the setting once at the top. Set `EnableContainerLifecycleDiagnostics: true` in `Settings.json` to get the full trace back for troubleshooting.
+- `Truck_01_Base` / M3S built-in cargo remains fully outside Clippy management, unchanged from 1.1.9.
 
 ## 1.1.9
 
